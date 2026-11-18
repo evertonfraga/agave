@@ -550,7 +550,17 @@ pub fn verify_entries_cpu_in_pool(
 /// previous hash. Entries are independent of each other (each one starts from the
 /// previous entry's claimed hash), so advancing several chains together lets the
 /// core overlap them.
+///
+/// aarch64 has 32 vector registers, enough for 4 lanes of SHA2 state. On x86,
+/// SHA-NI's legacy SSE encoding can only address 16 registers: 4 lanes don't fit,
+/// and with an AVX-512 `-C target-cpu` LLVM then copies spilled lanes with
+/// 256-bit moves inside the hash loop, which makes Intel CPUs pay an SSE/AVX
+/// transition penalty on every SHA-NI instruction (measured ~75x slower on
+/// Granite Rapids). 2 lanes fit in registers and are fast on every CPU measured.
+#[cfg(target_arch = "aarch64")]
 const POH_VERIFY_LANES: usize = 4;
+#[cfg(not(target_arch = "aarch64"))]
+const POH_VERIFY_LANES: usize = 2;
 
 /// Plain (no mixin) hashes `next_hash_with_signatures` performs before its
 /// optional final mixin hash.
