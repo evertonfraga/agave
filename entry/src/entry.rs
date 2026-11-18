@@ -550,7 +550,7 @@ pub fn verify_entries_cpu_in_pool(
 /// previous hash. Entries are independent of each other (each one starts from the
 /// previous entry's claimed hash), so advancing several chains together lets the
 /// core overlap them.
-const POH_VERIFY_LANES: usize = 2;
+const POH_VERIFY_LANES: usize = 4;
 
 /// Plain (no mixin) hashes `next_hash_with_signatures` performs before its
 /// optional final mixin hash.
