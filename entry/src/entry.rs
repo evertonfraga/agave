@@ -563,6 +563,51 @@ fn num_plain_hashes(num_hashes: u64, num_transactions: usize) -> u64 {
     }
 }
 
+/// Applies `iterations` plain hashes (`h = hash(h)`) to every lane: with the
+/// CPU's SHA-256 instructions on all lanes at once when available and
+/// self-tested, otherwise one hash at a time.
+fn hash_lanes<const N: usize>(hashes: &mut [Hash; N], iterations: u64) {
+    if iterations > 0 && sha256_chains_self_test_passed() {
+        let mut bytes = hashes.map(|hash| hash.to_bytes());
+        if crate::sha256_chains::hash_chains(&mut bytes, iterations) {
+            *hashes = bytes.map(Hash::new_from_array);
+            return;
+        }
+    }
+    for _ in 0..iterations {
+        for hash in hashes.iter_mut() {
+            *hash = solana_sha256_hasher::hash(hash.as_ref());
+        }
+    }
+}
+
+/// One-time known-answer check of the accelerated multi-lane kernel against the
+/// scalar hasher, so a kernel that misbehaves on some CPU falls back to the
+/// scalar path instead of producing wrong verification results.
+fn sha256_chains_self_test_passed() -> bool {
+    static PASSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PASSED.get_or_init(|| {
+        const ITERATIONS: u64 = 3;
+        let starts: [[u8; 32]; POH_VERIFY_LANES] =
+            std::array::from_fn(|i| solana_sha256_hasher::hash(&i.to_le_bytes()).to_bytes());
+        let mut accelerated = starts;
+        if !crate::sha256_chains::hash_chains(&mut accelerated, ITERATIONS) {
+            return false; // no SHA-256 instructions: scalar path
+        }
+        let scalar = starts.map(|mut hash| {
+            for _ in 0..ITERATIONS {
+                hash = solana_sha256_hasher::hash(&hash).to_bytes();
+            }
+            hash
+        });
+        let passed = accelerated == scalar;
+        if !passed {
+            error!("multi-lane SHA-256 kernel failed its self-test; using the scalar hasher");
+        }
+        passed
+    })
+}
+
 /// Lockstep equivalent of calling `next_hash_with_signatures` on every lane.
 fn next_hashes_interleaved<const N: usize>(
     start_hashes: [Hash; N],
@@ -573,11 +618,7 @@ fn next_hashes_interleaved<const N: usize>(
         num_plain_hashes(entries[i].num_hashes, entries[i].num_transactions)
     });
     let common = plain_hashes.iter().copied().min().unwrap_or(0);
-    for _ in 0..common {
-        for hash in hashes.iter_mut() {
-            *hash = solana_sha256_hasher::hash(hash.as_ref());
-        }
-    }
+    hash_lanes(&mut hashes, common);
     for ((hash, plain), entry) in hashes.iter_mut().zip(plain_hashes).zip(entries) {
         for _ in common..plain {
             *hash = solana_sha256_hasher::hash(hash.as_ref());
@@ -1402,6 +1443,15 @@ mod tests {
         check::<2>();
         check::<3>();
         check::<4>();
+    }
+
+    #[test]
+    fn test_sha256_chains_self_test() {
+        // Apple silicon always has the SHA-256 instructions, so the accelerated
+        // kernel must pass its self-test and be the path the fuzz tests exercise.
+        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            assert!(sha256_chains_self_test_passed());
+        }
     }
 
     #[test]
