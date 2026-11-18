@@ -542,28 +542,121 @@ pub fn verify_entries_cpu_in_pool(
     thread_pool.install(|| verify_entries_cpu(entries, start_hash))
 }
 
+/// Number of independent entry hash chains a verification task advances in
+/// lockstep.
+///
+/// Each entry's PoH chain is a serial SHA-256 dependency chain, so verifying one
+/// entry at a time leaves most of a core's SHA pipeline idle waiting on the
+/// previous hash. Entries are independent of each other (each one starts from the
+/// previous entry's claimed hash), so advancing several chains together lets the
+/// core overlap them.
+const POH_VERIFY_LANES: usize = 2;
+
+/// Plain (no mixin) hashes `next_hash_with_signatures` performs before its
+/// optional final mixin hash.
+fn num_plain_hashes(num_hashes: u64, num_transactions: usize) -> u64 {
+    if num_transactions == 0 {
+        // `num_hashes - 1` hashes plus the tick hash; 0 returns the start hash.
+        num_hashes
+    } else {
+        num_hashes.saturating_sub(1)
+    }
+}
+
+/// Lockstep equivalent of calling `next_hash_with_signatures` on every lane.
+fn next_hashes_interleaved<const N: usize>(
+    start_hashes: [Hash; N],
+    entries: [&EntryVerificationData; N],
+) -> [Hash; N] {
+    let mut hashes = start_hashes;
+    let plain_hashes: [u64; N] = std::array::from_fn(|i| {
+        num_plain_hashes(entries[i].num_hashes, entries[i].num_transactions)
+    });
+    let common = plain_hashes.iter().copied().min().unwrap_or(0);
+    for _ in 0..common {
+        for hash in hashes.iter_mut() {
+            *hash = solana_sha256_hasher::hash(hash.as_ref());
+        }
+    }
+    for ((hash, plain), entry) in hashes.iter_mut().zip(plain_hashes).zip(entries) {
+        for _ in common..plain {
+            *hash = solana_sha256_hasher::hash(hash.as_ref());
+        }
+        if entry.num_transactions != 0 {
+            let mixin = hash_signatures(&entry.signatures);
+            *hash = solana_sha256_hasher::hashv(&[hash.as_ref(), mixin.as_ref()]);
+        }
+    }
+    hashes
+}
+
+/// Compares an entry's claimed hash with the recomputed one, logging the same
+/// warnings as the per-entry `EntryVerificationData::verify` path.
+fn check_entry_hash(
+    prev: &EntryVerificationData,
+    entry: &EntryVerificationData,
+    computed: Hash,
+) -> bool {
+    if entry.hash != computed {
+        warn!(
+            "next_hash is invalid expected: {:?} actual: {:?}",
+            entry.hash, computed
+        );
+        warn!(
+            "entry invalid!: x0: {:?}, x1: {:?} num txs: {}",
+            prev.hash, entry.hash, entry.num_transactions
+        );
+        return false;
+    }
+    true
+}
+
 fn verify_entries_cpu_generic(
     entries: &[EntryVerificationData],
     start_hash: &Hash,
 ) -> EntryVerificationState {
     let now = Instant::now();
-    let genesis = [EntryVerificationData {
+    let genesis = EntryVerificationData {
         num_hashes: 0,
         hash: *start_hash,
         num_transactions: 0,
         signatures: Vec::new(),
-    }];
-    let entry_pairs = genesis.par_iter().chain(entries).zip(entries);
-    let res = entry_pairs.all(|(x0, x1)| {
-        let r = x1.verify(&x0.hash);
-        if !r {
-            warn!(
-                "entry invalid!: x0: {:?}, x1: {:?} num txs: {}",
-                x0.hash, x1.hash, x1.num_transactions
-            );
-        }
-        r
-    });
+    };
+    let res = entries
+        .par_chunks(POH_VERIFY_LANES)
+        .enumerate()
+        .all(|(chunk_index, chunk)| {
+            let first = chunk_index.saturating_mul(POH_VERIFY_LANES);
+            // The entry before `chunk[i]`, or the synthetic genesis entry.
+            let prev = |i: usize| {
+                first
+                    .saturating_add(i)
+                    .checked_sub(1)
+                    .map_or(&genesis, |p| &entries[p])
+            };
+            if let Ok(lanes) = <&[EntryVerificationData; POH_VERIFY_LANES]>::try_from(chunk) {
+                let computed = next_hashes_interleaved::<POH_VERIFY_LANES>(
+                    std::array::from_fn(|i| prev(i).hash),
+                    std::array::from_fn(|i| &lanes[i]),
+                );
+                lanes
+                    .iter()
+                    .zip(computed)
+                    .enumerate()
+                    .all(|(i, (entry, computed))| check_entry_hash(prev(i), entry, computed))
+            } else {
+                // Trailing partial chunk: verify one entry at a time.
+                chunk.iter().enumerate().all(|(i, entry)| {
+                    let computed = next_hash_with_signatures(
+                        &prev(i).hash,
+                        entry.num_hashes,
+                        entry.num_transactions,
+                        &entry.signatures,
+                    );
+                    check_entry_hash(prev(i), entry, computed)
+                })
+            }
+        });
     let poh_duration_us = now.elapsed().as_micros() as u64;
     EntryVerificationState {
         verification_status: res,
@@ -1250,6 +1343,118 @@ mod tests {
             assert_eq!(res, !modified);
             time.stop();
             info!("{time} {res}");
+        }
+    }
+
+    /// A random tick or transaction entry starting at `prev`, hashed with the
+    /// scalar reference `next_hash_with_signatures`. Covers the edge cases of
+    /// that function: 0/1/2 hashes, ticks, and transaction entries.
+    fn random_verification_data(prev: &Hash) -> EntryVerificationData {
+        let mut rng = rng();
+        let num_hashes = match rng.random_range(0..4) {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => rng.random_range(3..64),
+        };
+        let num_transactions = if rng.random_ratio(1, 2) {
+            0
+        } else {
+            rng.random_range(1..4)
+        };
+        let num_signatures = num_transactions * rng.random_range(1..3);
+        let signatures: Vec<Signature> = (0..num_signatures)
+            .map(|_| {
+                let mut bytes = [0u8; 64];
+                rng.fill(&mut bytes[..]);
+                Signature::from(bytes)
+            })
+            .collect();
+        EntryVerificationData {
+            num_hashes,
+            hash: next_hash_with_signatures(prev, num_hashes, num_transactions, &signatures),
+            num_transactions,
+            signatures,
+        }
+    }
+
+    #[test]
+    fn test_next_hashes_interleaved_matches_scalar() {
+        fn check<const N: usize>() {
+            for _ in 0..200 {
+                let starts: [Hash; N] = std::array::from_fn(|_| Hash::new_unique());
+                let data: [EntryVerificationData; N] =
+                    std::array::from_fn(|i| random_verification_data(&starts[i]));
+                let computed = next_hashes_interleaved(starts, std::array::from_fn(|i| &data[i]));
+                for ((computed, entry), start) in computed.iter().zip(&data).zip(&starts) {
+                    let expected = next_hash_with_signatures(
+                        start,
+                        entry.num_hashes,
+                        entry.num_transactions,
+                        &entry.signatures,
+                    );
+                    assert_eq!(*computed, expected);
+                    assert_eq!(*computed, entry.hash);
+                }
+            }
+        }
+        check::<1>();
+        check::<2>();
+        check::<3>();
+        check::<4>();
+    }
+
+    #[test]
+    fn test_verify_entries_interleaved_fuzz() {
+        agave_logger::setup();
+        let thread_pool = thread_pool_for_tests();
+        let reference = |entries: &[EntryVerificationData], start: &Hash| {
+            let mut prev = *start;
+            entries.iter().all(|entry| {
+                let ok = entry.verify(&prev);
+                prev = entry.hash;
+                ok
+            })
+        };
+        for _ in 0..300 {
+            let start = Hash::new_unique();
+            // Empty, partial-only, and multi-chunk slices with a partial tail.
+            let len = rng().random_range(0..20);
+            let mut prev = start;
+            let mut entries: Vec<EntryVerificationData> = (0..len)
+                .map(|_| {
+                    let entry = random_verification_data(&prev);
+                    prev = entry.hash;
+                    entry
+                })
+                .collect();
+            assert!(reference(&entries, &start));
+            assert!(verify_entries_cpu_in_pool(&entries, &start, &thread_pool).status());
+            if len == 0 {
+                continue;
+            }
+
+            assert!(
+                !verify_entries_cpu_in_pool(&entries, &Hash::new_unique(), &thread_pool).status()
+            );
+
+            let idx = rng().random_range(0..len);
+            match rng().random_range(0..3) {
+                0 => entries[idx].hash = Hash::new_unique(),
+                // +2 always changes the hash count, even for a transaction entry
+                // with 0 hashes (0 and 1 are equivalent there).
+                1 => entries[idx].num_hashes += 2,
+                _ => match entries[idx].signatures.first_mut() {
+                    Some(signature) => {
+                        let mut bytes: [u8; 64] = signature.as_ref().try_into().unwrap();
+                        bytes[0] ^= 1;
+                        *signature = Signature::from(bytes);
+                    }
+                    None => entries[idx].hash = Hash::new_unique(),
+                },
+            }
+            assert!(!reference(&entries, &start));
+            assert!(!verify_entries_cpu_in_pool(&entries, &start, &thread_pool).status());
         }
     }
 
