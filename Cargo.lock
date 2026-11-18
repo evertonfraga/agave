@@ -9492,6 +9492,7 @@ dependencies = [
  "num_cpus",
  "rayon",
  "solana-entry",
+ "solana-hash",
  "solana-measure",
  "solana-sha256-hasher",
  "solana-version",
