@@ -104,9 +104,7 @@ impl Server {
                 max_slots: Arc::new(MaxSlots::default()),
                 leader_schedule_cache: leader_schedule_cache.clone(),
                 max_complete_transaction_status_slot: Arc::new(AtomicU64::new(tip_slot)),
-                max_complete_and_rooted_transaction_status_slot: Arc::new(AtomicU64::new(
-                    tip_slot,
-                )),
+                max_complete_and_rooted_transaction_status_slot: Arc::new(AtomicU64::new(tip_slot)),
                 prioritization_fee_cache: None,
                 rpc_tpu_client_args: RpcTpuClientArgs(
                     &identity,

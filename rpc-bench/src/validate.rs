@@ -43,7 +43,12 @@ pub fn run(
         .iter()
         .filter_map(|t| match blockstore.get_rooted_transaction(t.signature) {
             Ok(Some(_)) => None,
-            other => Some(format!("{:?} in slot {}: {:?}", t.kind, t.slot, other.map(|t| t.is_some()))),
+            other => Some(format!(
+                "{:?} in slot {}: {:?}",
+                t.kind,
+                t.slot,
+                other.map(|t| t.is_some())
+            )),
         })
         .collect();
     check(missing.is_empty(), || {
@@ -57,7 +62,11 @@ pub fn run(
     let first = &history.transactions[0];
     let block = blockstore.get_rooted_block(first.slot, true);
     check(block.is_ok(), || {
-        format!("blockstore has no rooted block {}: {:?}", first.slot, block.err())
+        format!(
+            "blockstore has no rooted block {}: {:?}",
+            first.slot,
+            block.err()
+        )
     })?;
 
     let mut connection = Connection::open(runtime, addr)?;
@@ -70,10 +79,12 @@ pub fn run(
         .filter(|t| t.kind == TxKind::Swap { fail: true })
         .count() as u64;
     check(
-        history.executed == history.transactions.len() as u64 && history.failed == expected_failures,
+        history.executed == history.transactions.len() as u64
+            && history.failed == expected_failures,
         || {
             format!(
-                "history executed {} and failed {} transactions, expected {} and {expected_failures}",
+                "history executed {} and failed {} transactions, expected {} and \
+                 {expected_failures}",
                 history.executed,
                 history.failed,
                 history.transactions.len()
@@ -184,12 +195,25 @@ pub fn run(
         let accounts = request(requests::get_token_accounts_by_owner(&world.wallets[owner]))?;
         check(
             len(&accounts["value"]) == world.owner_token_accounts[owner].len(),
-            || format!("getTokenAccountsByOwner of owner {owner} returned {}", len(&accounts["value"])),
+            || {
+                format!(
+                    "getTokenAccountsByOwner of owner {owner} returned {}",
+                    len(&accounts["value"])
+                )
+            },
         )?;
-        let signatures = request(requests::get_signatures_for_address(&world.wallets[owner], 20))?;
+        let signatures = request(requests::get_signatures_for_address(
+            &world.wallets[owner],
+            20,
+        ))?;
         check(
             len(&signatures) == history.wallet_transactions[owner].min(20),
-            || format!("getSignaturesForAddress of owner {owner} returned {}", len(&signatures)),
+            || {
+                format!(
+                    "getSignaturesForAddress of owner {owner} returned {}",
+                    len(&signatures)
+                )
+            },
         )?;
     }
 
@@ -199,7 +223,10 @@ pub fn run(
             requests::scan_filters(world, market),
         ))?;
         check(len(&accounts) == world.scan_positions[market], || {
-            format!("getProgramAccounts for market {market} returned {}", len(&accounts))
+            format!(
+                "getProgramAccounts for market {market} returned {}",
+                len(&accounts)
+            )
         })?;
     }
     let mint = world.token_mints.len() / 2;
@@ -207,9 +234,15 @@ pub fn run(
         &spl_token_interface::id(),
         requests::mint_filters(&world.token_mints[mint]),
     ))?;
-    check(len(&accounts) == world.token_mint_holders[mint].len(), || {
-        format!("getProgramAccounts for mint {mint} returned {}", len(&accounts))
-    })?;
+    check(
+        len(&accounts) == world.token_mint_holders[mint].len(),
+        || {
+            format!(
+                "getProgramAccounts for mint {mint} returned {}",
+                len(&accounts)
+            )
+        },
+    )?;
     let whale_accounts = request(requests::get_token_accounts_by_owner(&world.whales[0]))?;
     let expected = world
         .token_accounts
@@ -217,17 +250,26 @@ pub fn run(
         .filter(|a| a.owner == world.whales[0])
         .count();
     check(len(&whale_accounts["value"]) == expected, || {
-        format!("whale has {} token accounts, expected {expected}", len(&whale_accounts["value"]))
+        format!(
+            "whale has {} token accounts, expected {expected}",
+            len(&whale_accounts["value"])
+        )
     })?;
 
     let slot = *history.transaction_slots.last().unwrap();
     let block = request(requests::get_block(slot, "full"))?;
     check(len(&block["transactions"]) == transactions_per_slot, || {
-        format!("getBlock {slot} returned {} transactions", len(&block["transactions"]))
+        format!(
+            "getBlock {slot} returned {} transactions",
+            len(&block["transactions"])
+        )
     })?;
     let block = request(requests::get_block(slot, "signatures"))?;
     check(len(&block["signatures"]) == transactions_per_slot, || {
-        format!("getBlock {slot} returned {} signatures", len(&block["signatures"]))
+        format!(
+            "getBlock {slot} returned {} signatures",
+            len(&block["signatures"])
+        )
     })?;
     let signatures = request(requests::get_signatures_for_address(
         &spl_token_interface::id(),
@@ -235,11 +277,19 @@ pub fn run(
     ))?;
     check(
         len(&signatures) == history.token_program_transactions.min(1000),
-        || format!("getSignaturesForAddress for the Token program returned {}", len(&signatures)),
+        || {
+            format!(
+                "getSignaturesForAddress for the Token program returned {}",
+                len(&signatures)
+            )
+        },
     )?;
 
     let blockhash = tip.last_blockhash();
-    for request_type in REQUEST_TYPES.iter().filter(|t| t.name.starts_with("simulate.")) {
+    for request_type in REQUEST_TYPES
+        .iter()
+        .filter(|t| t.name.starts_with("simulate."))
+    {
         for n in 0..2 {
             let body = requests::exec_body(rng, world, request_type.name, n, blockhash);
             let result = request(body)?;
@@ -255,7 +305,10 @@ pub fn run(
                 })?;
             }
             if n == 0 {
-                println!("exec type={} units={}", request_type.name, value["unitsConsumed"]);
+                println!(
+                    "exec type={} units={}",
+                    request_type.name, value["unitsConsumed"]
+                );
             }
         }
     }

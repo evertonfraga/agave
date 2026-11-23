@@ -34,8 +34,8 @@ impl Summary {
         let n = self.latencies_us.len();
         let total_us: u64 = self.latencies_us.iter().sum();
         format!(
-            "{kind} {name} n={n} rps={:.1} p50_us={} p99_us={} max_us={} mean_us={} \
-             bytes_mean={} bytes_total={} errors=0",
+            "{kind} {name} n={n} rps={:.1} p50_us={} p99_us={} max_us={} mean_us={} bytes_mean={} \
+             bytes_total={} errors=0",
             n as f64 / elapsed.as_secs_f64(),
             self.percentile(50),
             self.percentile(99),
@@ -101,7 +101,12 @@ pub fn thread_cpu() -> BTreeMap<u32, (String, u64)> {
         };
         let name = stat[open + 1..close].to_string();
         let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-        let ticks = |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok()).unwrap_or(0);
+        let ticks = |i: usize| {
+            fields
+                .get(i)
+                .and_then(|f| f.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
         threads.insert(tid, (name, ticks(11) + ticks(12)));
     }
     threads

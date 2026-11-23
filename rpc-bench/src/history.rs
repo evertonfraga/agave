@@ -22,9 +22,9 @@ use {
         bank::Bank, bank_forks::BankForks, genesis_utils::GenesisConfigInfo,
         runtime_config::RuntimeConfig, transaction_execution::TransactionStatusSender,
     },
-    solana_unified_scheduler_pool::DefaultSchedulerPool,
     solana_signature::Signature,
     solana_signer::Signer,
+    solana_unified_scheduler_pool::DefaultSchedulerPool,
     std::{
         collections::HashMap,
         path::Path,

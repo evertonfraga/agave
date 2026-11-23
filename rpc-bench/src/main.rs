@@ -338,9 +338,10 @@ fn main() {
     let rent = genesis_config.rent.clone();
     let programs: Vec<_> = solana_program_binaries::spl_programs(&rent)
         .into_iter()
-        .chain(solana_program_binaries::core_bpf_programs(&rent, |feature| {
-            genesis_config.accounts.contains_key(feature)
-        }))
+        .chain(solana_program_binaries::core_bpf_programs(
+            &rent,
+            |feature| genesis_config.accounts.contains_key(feature),
+        ))
         .collect();
     for (address, account) in programs {
         genesis_config
@@ -477,10 +478,7 @@ fn measure(
         warmup.clone(),
         concurrency,
     )?;
-    println!(
-        "BENCH_PHASE:warmup:{:.6}",
-        outcome.elapsed.as_secs_f64()
-    );
+    println!("BENCH_PHASE:warmup:{:.6}", outcome.elapsed.as_secs_f64());
     let start = stats::thread_cpu();
     let outcome = client::run(
         runtime,

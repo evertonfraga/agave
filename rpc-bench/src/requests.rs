@@ -200,7 +200,11 @@ pub fn get_block(slot: u64, transaction_details: &str) -> Bytes {
     )
 }
 
-pub fn simulate(transaction: &solana_transaction::Transaction, sig_verify: bool, inner: bool) -> Bytes {
+pub fn simulate(
+    transaction: &solana_transaction::Transaction,
+    sig_verify: bool,
+    inner: bool,
+) -> Bytes {
     let wire = BASE64_STANDARD.encode(wincode::serialize(transaction).unwrap());
     body(
         "simulateTransaction",
@@ -242,7 +246,11 @@ pub fn exec_body(
     let owner = index(rng, world.active.len());
     let transaction = world.transaction(rng, kind, owner, blockhash);
     let sig_verify = matches!(kind, TxKind::Swap { .. }) && n % 2 == 0;
-    simulate(&transaction, sig_verify, matches!(kind, TxKind::CreateAta(_)))
+    simulate(
+        &transaction,
+        sig_verify,
+        matches!(kind, TxKind::CreateAta(_)),
+    )
 }
 
 /// Draws a key the way a client would: popular accounts are read more often.
@@ -343,7 +351,9 @@ pub fn build_pools(
                 })
                 .collect(),
             "getTokenAccountsByOwner" => (0..pool(4_096))
-                .map(|_| get_token_accounts_by_owner(&world.wallets[index(rng, world.active.len())]))
+                .map(|_| {
+                    get_token_accounts_by_owner(&world.wallets[index(rng, world.active.len())])
+                })
                 .collect(),
             "getSignaturesForAddress" => (0..pool(4_096))
                 .map(|_| {
@@ -351,7 +361,9 @@ pub fn build_pools(
                 })
                 .collect(),
             "getProgramAccounts.scan" => (0..crate::world::NUM_MARKETS)
-                .map(|market| get_program_accounts(&world.scan_program, scan_filters(world, market)))
+                .map(|market| {
+                    get_program_accounts(&world.scan_program, scan_filters(world, market))
+                })
                 .collect(),
             "getProgramAccounts.mint" => (MINT_QUERY_RANK..MINT_QUERY_RANK + 3)
                 .map(|rank| {

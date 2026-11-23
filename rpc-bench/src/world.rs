@@ -168,9 +168,7 @@ fn mint_data(supply: u64) -> Vec<u8> {
 
 impl World {
     pub fn new(rng: &mut ChaCha8Rng, sizes: &Sizes) -> Self {
-        let active: Vec<_> = (0..sizes.active_owners)
-            .map(|_| new_keypair(rng))
-            .collect();
+        let active: Vec<_> = (0..sizes.active_owners).map(|_| new_keypair(rng)).collect();
         let wallets: Vec<_> = active
             .iter()
             .map(|keypair| keypair.pubkey())
@@ -210,7 +208,8 @@ impl World {
         while token_accounts.len() < sizes.token_accounts {
             // Single accounts belong to wallets that never sign, so the
             // balances of those wallets stay at their genesis values.
-            let owner = wallets[range(rng, sizes.active_owners as u64, sizes.wallets as u64) as usize];
+            let owner =
+                wallets[range(rng, sizes.active_owners as u64, sizes.wallets as u64) as usize];
             let mint = zipf.sample(rng);
             token_accounts.push(TokenHolding {
                 address: new_pubkey(rng),
@@ -273,7 +272,11 @@ impl World {
 
     /// Returns every world account. The scan account data is drawn here,
     /// and the POSITION count per market is recorded for the checks.
-    pub fn accounts(&mut self, rng: &mut ChaCha8Rng, rent: &Rent) -> Vec<(Pubkey, AccountSharedData)> {
+    pub fn accounts(
+        &mut self,
+        rng: &mut ChaCha8Rng,
+        rent: &Rent,
+    ) -> Vec<(Pubkey, AccountSharedData)> {
         let mut accounts = Vec::with_capacity(self.num_accounts());
         for (wallet, lamports) in self.wallets.iter().zip(&self.wallet_lamports) {
             accounts.push((
@@ -323,7 +326,10 @@ impl World {
         }
         let pool_lamports = rent.minimum_balance(POOL_ACCOUNT_SIZE);
         for (address, data) in self.pool_accounts.iter().zip(&self.pool_data) {
-            accounts.push((*address, owned(pool_lamports, data.clone(), &self.pool_program)));
+            accounts.push((
+                *address,
+                owned(pool_lamports, data.clone(), &self.pool_program),
+            ));
         }
         accounts
     }
@@ -363,7 +369,13 @@ impl World {
         .unwrap()
     }
 
-    fn t22_transfer(&self, rng: &mut ChaCha8Rng, owner: usize, n: usize, amount: u64) -> Instruction {
+    fn t22_transfer(
+        &self,
+        rng: &mut ChaCha8Rng,
+        owner: usize,
+        n: usize,
+        amount: u64,
+    ) -> Instruction {
         let accounts = &self.owner_t22_accounts[owner];
         let source = accounts[n % accounts.len()];
         let holding = &self.t22_accounts[source];
@@ -381,7 +393,9 @@ impl World {
     }
 
     fn memo(rng: &mut ChaCha8Rng, len: usize) -> Instruction {
-        let memo: Vec<u8> = (0..len).map(|_| b'a' + (rng.next_u32() % 26) as u8).collect();
+        let memo: Vec<u8> = (0..len)
+            .map(|_| b'a' + (rng.next_u32() % 26) as u8)
+            .collect();
         spl_memo_interface::instruction::build_memo(&spl_memo_interface::v3::id(), &memo, &[])
     }
 
