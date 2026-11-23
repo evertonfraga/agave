@@ -455,7 +455,6 @@ dependencies = [
  "solana-keypair",
  "solana-leader-schedule",
  "solana-ledger",
- "solana-message",
  "solana-net-utils",
  "solana-program-binaries",
  "solana-program-pack",
