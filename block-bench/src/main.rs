@@ -1362,7 +1362,6 @@ fn pick_dropped(config: &Config, slot: Slot, shreds: &[Shred]) -> (Vec<bool>, us
 /// hash or the block id. Then the footer and alpentick are shredded again
 /// with the real hash, and the final shreds give the block id that the next
 /// header and later certificates refer to.
-#[allow(clippy::too_many_arguments)]
 fn generate_blocks(
     config: &Config,
     world: &World,
@@ -1478,7 +1477,7 @@ fn generate_blocks(
             .unwrap_or_else(|| bank.clock().unix_timestamp.saturating_mul(1_000_000_000));
         let (lower, upper) = BlockComponentProcessor::nanosecond_time_bounds(
             parent_time_nanos,
-            bank.slot_range_duration_nanos(slot - 1 + 1, slot),
+            bank.slot_range_duration_nanos(parent.slot() + 1, slot),
         );
         let block_producer_time_nanos = (parent_time_nanos + FOOTER_TIME_STEP_NANOS)
             .clamp(lower, upper)
@@ -1888,7 +1887,6 @@ struct Measured {
 }
 
 /// Runs stages A to D over every block and times the selected stages.
-#[allow(clippy::too_many_arguments)]
 fn run_measured(
     config: &Config,
     blocks: &[BlockData],
