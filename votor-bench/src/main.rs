@@ -20,6 +20,7 @@ use {
     agave_bls_sigverify::{
         bls_sigverifier::{
             NUM_SLOTS_FOR_VERIFY, SigVerifier, SigVerifierChannels, SigVerifierContext,
+            spawn_service,
         },
         generated_cert_types::GeneratedCertTypes,
         sig_verified_messages::{SigVerifiedBatch, VoteAggregate},
@@ -32,7 +33,7 @@ use {
         unverified_vote_message::UnverifiedCertificate,
         vote::Vote,
     },
-    agave_votor_transport::endpoint::stub_ban_channel_for_tests,
+    agave_votor_transport::endpoint::{Datagram, stub_ban_channel_for_tests},
     clap::{App, Arg, crate_description, crate_name, value_t_or_exit},
     crossbeam_channel::unbounded,
     solana_pubkey::Pubkey,
@@ -45,18 +46,32 @@ use {
     std::{
         collections::{HashMap, HashSet},
         num::NonZeroUsize,
-        sync::{Arc, RwLock},
+        sync::{
+            Arc, RwLock,
+            atomic::{AtomicBool, Ordering},
+        },
         time::{Duration, Instant},
     },
 };
 
 const REPAIR_CHANNEL_CAPACITY: usize = 4_096;
 const BAN_CHANNEL_CAPACITY: usize = 4_096;
+/// How long `--driver service` waits for the sigverifier's next output.
+const SERVICE_TIMEOUT: Duration = Duration::from_secs(30);
 /// With a pass window below the smallest peer latency, a certificate copy that does not race
 /// the node's own threshold crossing always arrives after the node built the certificate.
 const MIN_LATENCY_US: u64 = 5_000;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Driver {
+    /// One `verify_and_send_for_bench()` call per pass, with certificate building after each.
+    Pass,
+    /// The unmodified sigverifier service, with every datagram queued up front.
+    Service,
+}
+
 struct Config {
+    driver: Driver,
     validators: usize,
     rounds: usize,
     threads: usize,
@@ -149,6 +164,20 @@ impl Config {
                     .help("Seed for keys and traffic"),
             )
             .arg(
+                Arg::with_name("driver")
+                    .long("driver")
+                    .value_name("DRIVER")
+                    .takes_value(true)
+                    .possible_values(&["pass", "service"])
+                    .default_value("pass")
+                    .help(
+                        "\"pass\" runs one sigverifier pass per window, with certificate building \
+                         after each. \"service\" runs the sigverifier service on all datagrams at \
+                         once, without certificate building, so that each pass takes up to 5000 \
+                         datagrams.",
+                    ),
+            )
+            .arg(
                 Arg::with_name("check")
                     .long("check")
                     .help("Check the results of every round and print the certificates"),
@@ -179,7 +208,12 @@ impl Config {
             0 => std::thread::available_parallelism().map_or(1, NonZeroUsize::get),
             threads => threads,
         };
+        let driver = match matches.value_of("driver").unwrap() {
+            "service" => Driver::Service,
+            _ => Driver::Pass,
+        };
         Self {
+            driver,
             validators,
             rounds: value_t_or_exit!(matches, "rounds", usize),
             threads,
@@ -234,11 +268,16 @@ impl CertBuilder<'_> {
         }
     }
 
-    fn add_aggregate(&mut self, aggregate: &VoteAggregate) {
-        let vote = *aggregate.vote();
+    fn record_votes(&mut self, aggregate: &VoteAggregate) {
         if let Some(verified_votes) = &mut self.verified_votes {
+            let vote = *aggregate.vote();
             verified_votes.extend(aggregate.ranks().iter_ones().map(|rank| (vote, rank)));
         }
+    }
+
+    fn add_aggregate(&mut self, aggregate: &VoteAggregate) {
+        self.record_votes(aggregate);
+        let vote = *aggregate.vote();
         let accumulator = self.accumulators.entry(vote).or_insert_with(|| {
             let mut accumulator = AggregateAccumulator::new(self.max_validators);
             if let Some(own_vote) = self.own_votes.get(&vote) {
@@ -300,9 +339,9 @@ fn run_round(
     let (channel_to_repair, repair_receiver) = EvictingSender::new_bounded(REPAIR_CHANNEL_CAPACITY);
     let (channel_to_reward, reward_receiver) = unbounded();
     let (channel_to_metrics, metrics_receiver) = unbounded();
-    // The benchmark passes the inputs to the sigverifier directly, so these stay empty.
-    let (_packet_sender, packet_receiver) = unbounded();
-    let (_certificate_sender, certificate_receiver) = unbounded();
+    // The pass driver calls the sigverifier directly, so these stay empty there.
+    let (packet_sender, packet_receiver) = unbounded();
+    let (certificate_sender, certificate_receiver) = unbounded();
     let (ban_sender, mut ban_receiver) = stub_ban_channel_for_tests(BAN_CHANNEL_CAPACITY);
     let generated_cert_types = Arc::new(GeneratedCertTypes::default());
     let context = SigVerifierContext {
@@ -328,7 +367,6 @@ fn run_round(
         channel_to_pool,
         channel_to_metrics,
     );
-    let mut verifier = SigVerifier::new(context, channels);
     let mut builder = CertBuilder {
         own_votes: &traffic.own_votes,
         max_validators: cluster.rank_map.len(),
@@ -342,23 +380,76 @@ fn run_round(
     };
     let mut banned = Vec::new();
 
-    for pass in &traffic.passes {
-        let certificates = pass.certificates.clone();
-        let start = Instant::now();
-        verifier
-            .verify_and_send_for_bench(&traffic.datagrams[pass.datagrams.clone()], certificates);
-        timings.sigverify += start.elapsed();
+    match config.driver {
+        Driver::Pass => {
+            let mut verifier = SigVerifier::new(context, channels);
+            for pass in &traffic.passes {
+                let certificates = pass.certificates.clone();
+                let start = Instant::now();
+                verifier.verify_and_send_for_bench(
+                    &traffic.datagrams[pass.datagrams.clone()],
+                    certificates,
+                );
+                timings.sigverify += start.elapsed();
 
-        let start = Instant::now();
-        builder.process(pool_receiver.try_iter().collect());
-        timings.cert_build += start.elapsed();
+                let start = Instant::now();
+                builder.process(pool_receiver.try_iter().collect());
+                timings.cert_build += start.elapsed();
 
-        // Other consumers of the sigverifier's output, which are not measured.
-        repair_receiver.try_iter().for_each(drop);
-        reward_receiver.try_iter().for_each(drop);
-        metrics_receiver.try_iter().for_each(drop);
-        while let Ok(ban) = ban_receiver.try_recv() {
-            banned.push(ban.peer);
+                // Other consumers of the sigverifier's output, which are not measured.
+                repair_receiver.try_iter().for_each(drop);
+                reward_receiver.try_iter().for_each(drop);
+                metrics_receiver.try_iter().for_each(drop);
+                while let Ok(ban) = ban_receiver.try_recv() {
+                    banned.push(ban.peer);
+                }
+            }
+        }
+        Driver::Service => {
+            for datagram in &traffic.datagrams {
+                packet_sender
+                    .send(Datagram {
+                        peer_pubkey: datagram.peer_pubkey,
+                        peer_address: datagram.peer_address,
+                        message: datagram.message.clone(),
+                    })
+                    .unwrap();
+            }
+            let exit = Arc::new(AtomicBool::new(false));
+            let start = Instant::now();
+            let service = spawn_service(exit.clone(), context, channels);
+            // The senders stay connected until every valid vote and one certificate of each
+            // type has arrived, because the service drops its last pass on a disconnect.
+            let mut num_votes = 0;
+            while num_votes < traffic.valid_votes.len()
+                || builder.received.len() < traffic.cert_types.len()
+            {
+                match pool_receiver
+                    .recv_timeout(SERVICE_TIMEOUT)
+                    .expect("sigverifier output")
+                {
+                    SigVerifiedBatch::Votes(aggregates) => {
+                        for aggregate in &aggregates {
+                            num_votes += aggregate.num_votes();
+                            builder.record_votes(aggregate);
+                        }
+                    }
+                    SigVerifiedBatch::Certificates(certs) => {
+                        for cert in certs {
+                            builder.completed.insert(cert.cert_type);
+                            builder.received.push(cert);
+                        }
+                    }
+                }
+            }
+            timings.sigverify += start.elapsed();
+            exit.store(true, Ordering::Relaxed);
+            drop(packet_sender);
+            drop(certificate_sender);
+            service.join().unwrap();
+            while let Ok(ban) = ban_receiver.try_recv() {
+                banned.push(ban.peer);
+            }
         }
     }
 
@@ -419,13 +510,14 @@ fn check(cluster: &Cluster, traffic: &Traffic, config: &Config, output: &RoundOu
     );
 
     let banned: HashSet<_> = output.banned.iter().copied().collect();
-    assert_eq!(output.banned.len(), traffic.bad_senders.len(), "ban count");
+    assert_eq!(output.banned.len(), traffic.num_bad_votes, "ban count");
     assert!(banned == traffic.bad_senders, "banned senders");
 
-    if config
-        .traffic
-        .pass_window_us
-        .is_some_and(|window| window < MIN_LATENCY_US)
+    if config.driver == Driver::Pass
+        && config
+            .traffic
+            .pass_window_us
+            .is_some_and(|window| window < MIN_LATENCY_US)
     {
         assert_eq!(
             output.received.len(),
@@ -486,8 +578,13 @@ fn main() {
     let setup = setup_start.elapsed();
     let num_passes = traffic.passes.len();
     eprintln!(
-        "agave-votor-bench: validators={} slots={} rounds={} threads={} pass_window_us={} \
-         cert_copies={} cert_race={} bad_votes_per_slot={} seed={} datagrams={} passes={}",
+        "agave-votor-bench: driver={} validators={} slots={} rounds={} threads={} \
+         pass_window_us={} cert_copies={} cert_race={} bad_votes_per_slot={} seed={} datagrams={} \
+         passes={}",
+        match config.driver {
+            Driver::Pass => "pass",
+            Driver::Service => "service",
+        },
         config.validators,
         config.traffic.slots,
         config.rounds,
@@ -528,19 +625,21 @@ fn main() {
         timings.cert_build.as_secs_f64()
     );
     println!("BENCH_PHASE:footer:{:.6}", timings.footer.as_secs_f64());
-    println!("BENCH_STAT:passes_per_round:{num_passes}");
-    println!(
-        "BENCH_STAT:datagrams_per_pass:{:.2}",
-        traffic.datagrams.len() as f64 / num_passes as f64
-    );
-    println!(
-        "BENCH_STAT:distinct_payloads_per_pass:{:.2}",
-        traffic.distinct_payloads as f64 / num_passes as f64
-    );
-    println!(
-        "BENCH_STAT:pass_us_mean:{:.1}",
-        timings.sigverify.as_secs_f64() * 1e6 / (num_passes * rounds) as f64
-    );
+    if config.driver == Driver::Pass {
+        println!("BENCH_STAT:passes_per_round:{num_passes}");
+        println!(
+            "BENCH_STAT:datagrams_per_pass:{:.2}",
+            traffic.datagrams.len() as f64 / num_passes as f64
+        );
+        println!(
+            "BENCH_STAT:distinct_payloads_per_pass:{:.2}",
+            traffic.distinct_payloads as f64 / num_passes as f64
+        );
+        println!(
+            "BENCH_STAT:pass_us_mean:{:.1}",
+            timings.sigverify.as_secs_f64() * 1e6 / (num_passes * rounds) as f64
+        );
+    }
     println!(
         "BENCH_STAT:network_certs_verified_per_round:{:.1}",
         network_certs as f64 / rounds as f64

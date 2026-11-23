@@ -97,8 +97,8 @@ impl Rng {
 
     fn bytes(&mut self) -> [u8; 32] {
         let mut bytes = [0; 32];
-        for chunk in bytes.chunks_exact_mut(8) {
-            chunk.copy_from_slice(&self.next_u64().to_le_bytes());
+        for chunk in bytes.as_chunks_mut::<8>().0 {
+            *chunk = self.next_u64().to_le_bytes();
         }
         bytes
     }
@@ -250,6 +250,10 @@ pub struct Traffic {
     pub valid_votes: HashSet<(Vote, usize)>,
     /// Senders of invalid votes.
     pub bad_senders: HashSet<Pubkey>,
+    /// Number of invalid votes. A sender can send more than one in different slots.
+    pub num_bad_votes: usize,
+    /// Types of the certificates the peers send.
+    pub cert_types: HashSet<CertificateType>,
     /// Number of certificates whose first copy arrives before the node's own crossing.
     pub raced_certs: usize,
     /// Sum over passes of the number of distinct vote payloads in the pass.
@@ -365,8 +369,9 @@ impl Traffic {
                 block_id: BlockId::from(Hash::new_from_array(rng.bytes())),
             })
             .collect();
-        let is_skip_voter =
-            |rank: usize, slot: Slot| slot % SKIP_SLOT_INTERVAL == 0 && skip_voters.contains(&rank);
+        let is_skip_voter = |rank: usize, slot: Slot| {
+            slot.is_multiple_of(SKIP_SLOT_INTERVAL) && skip_voters.contains(&rank)
+        };
         let first_vote = |rank: usize, block: &Block| {
             if is_skip_voter(rank, block.slot) {
                 Vote::new_skip_vote(block.slot)
@@ -402,6 +407,8 @@ impl Traffic {
         let mut own_votes = HashMap::new();
         let mut valid_votes = HashSet::new();
         let mut bad_senders = HashSet::new();
+        let mut num_bad_votes = 0;
+        let mut cert_types = HashSet::new();
         let mut raced_certs = 0;
 
         for (index, block) in blocks.iter().enumerate() {
@@ -501,6 +508,7 @@ impl Traffic {
                     });
                     if is_bad {
                         bad_senders.insert(cluster.node_pubkey(rank));
+                        num_bad_votes += 1;
                     } else {
                         valid_votes.insert((finalize_vote, rank));
                         finalize_arrivals.push((time_us, rank));
@@ -536,6 +544,9 @@ impl Traffic {
                         )
                     })
                     .collect();
+                if !copies.is_empty() {
+                    cert_types.insert(cert.cert_type);
+                }
                 if rng.chance(config.cert_race) && !copies.is_empty() {
                     raced_certs += 1;
                     let first = (0..copies.len()).min_by_key(|&i| copies[i]).unwrap();
@@ -562,7 +573,7 @@ impl Traffic {
             let final_certs: Vec<&Certificate> =
                 match (&notarize_crossing, &fast_crossing, &finalize_crossing) {
                     (Some((_, notarize)), _, Some((_, finalize)))
-                        if slot % SLOW_FINALIZATION_INTERVAL == 0 =>
+                        if slot.is_multiple_of(SLOW_FINALIZATION_INTERVAL) =>
                     {
                         vec![finalize, notarize]
                     }
@@ -633,6 +644,8 @@ impl Traffic {
             own_votes,
             valid_votes,
             bad_senders,
+            num_bad_votes,
+            cert_types,
             raced_certs,
             distinct_payloads,
         }
