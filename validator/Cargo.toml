@@ -97,6 +97,13 @@ solana-vote-program = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+# sha2 0.10 uses the ARMv8 SHA-2 instructions only with its `asm` feature, which
+# sha2 says library crates should not enable. Enabling it here turns it on for
+# every sha2 0.10 user in the build (solana-sha256-hasher, solana-sha512-hasher).
+# sha2 checks the CPU at run time and falls back to software.
+sha2 = { workspace = true, features = ["asm"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 caps = { workspace = true }
 
