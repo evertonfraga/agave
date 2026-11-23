@@ -15,19 +15,23 @@ use {
     solana_ledger::blockstore::Blockstore,
     solana_pubkey::Pubkey,
     solana_rpc::{
-        rpc::populate_blockstore_for_tests_with_config,
-        transaction_status_service::TransactionStatusServiceConfig,
+        rpc::populate_blockstore_with_scheduler_pool_for_tests,
+        transaction_status_service::{TransactionStatusService, TransactionStatusServiceConfig},
     },
     solana_runtime::{
         bank::Bank, bank_forks::BankForks, genesis_utils::GenesisConfigInfo,
-        runtime_config::RuntimeConfig,
+        runtime_config::RuntimeConfig, transaction_execution::TransactionStatusSender,
     },
+    solana_unified_scheduler_pool::DefaultSchedulerPool,
     solana_signature::Signature,
     solana_signer::Signer,
     std::{
         collections::HashMap,
         path::Path,
-        sync::{Arc, RwLock, atomic::AtomicU64},
+        sync::{
+            Arc, RwLock,
+            atomic::{AtomicBool, AtomicU64},
+        },
     },
 };
 
@@ -89,14 +93,6 @@ pub fn new_bank(
     )
 }
 
-fn transaction_status_config() -> TransactionStatusServiceConfig {
-    TransactionStatusServiceConfig {
-        enable_rpc_transaction_history: true,
-        enable_extended_tx_metadata_storage: true,
-        ..TransactionStatusServiceConfig::default_for_tests()
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     rng: &mut ChaCha8Rng,
@@ -106,6 +102,7 @@ pub fn build(
     blockstore: &Arc<Blockstore>,
     transaction_slots: u64,
     transactions_per_slot: usize,
+    handler_threads: usize,
 ) -> History {
     let leader = SlotLeader {
         id: genesis.validator_pubkey,
@@ -131,7 +128,32 @@ pub fn build(
         executed: 0,
         failed: 0,
     };
-    let throwaway_slot = Arc::new(AtomicU64::default());
+    // One transaction status service and one scheduler pool for all slots.
+    // Extended metadata keeps log messages and inner instructions, as on an
+    // RPC node with --enable-extended-tx-metadata-storage.
+    let (transaction_status_sender, transaction_status_receiver) = crossbeam_channel::unbounded();
+    let transaction_status_service = TransactionStatusService::new(
+        transaction_status_receiver,
+        Arc::new(AtomicU64::default()),
+        Arc::new(AtomicU64::default()),
+        blockstore.clone(),
+        TransactionStatusServiceConfig {
+            enable_rpc_transaction_history: true,
+            enable_extended_tx_metadata_storage: true,
+            ..TransactionStatusServiceConfig::default_for_tests()
+        },
+        Arc::new(AtomicBool::new(false)),
+        None,
+    );
+    let pool = DefaultSchedulerPool::new_for_verification(
+        Some(handler_threads),
+        None,
+        Some(TransactionStatusSender {
+            sender: transaction_status_sender,
+            dependency_tracker: None,
+        }),
+        None,
+    );
 
     for slot in 1..=WARMUP_SLOTS + transaction_slots {
         let bank = Bank::new_from_parent(parent.clone(), leader.clone(), slot);
@@ -191,13 +213,7 @@ pub fn build(
                 })
                 .collect()
         };
-        populate_blockstore_for_tests_with_config(
-            entries,
-            bank.clone(),
-            blockstore.clone(),
-            throwaway_slot.clone(),
-            transaction_status_config(),
-        );
+        populate_blockstore_with_scheduler_pool_for_tests(entries, bank.clone(), blockstore, &pool);
         bank.fill_bank_with_ticks_for_tests();
         bank.freeze();
         history.executed += bank.executed_transaction_count();
@@ -210,6 +226,10 @@ pub fn build(
         blockhashes.push(bank.last_blockhash());
         parent = bank;
     }
+
+    // Wait until every transaction status is written.
+    transaction_status_service.join().unwrap();
+    drop(pool);
 
     let tip_slot = parent.slot();
     bank_forks

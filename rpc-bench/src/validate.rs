@@ -11,6 +11,7 @@ use {
     base64::{Engine, prelude::BASE64_STANDARD},
     rand_chacha::ChaCha8Rng,
     serde_json::Value,
+    solana_ledger::blockstore::Blockstore,
     solana_pubkey::Pubkey,
     std::net::SocketAddr,
     tokio::runtime::Runtime,
@@ -32,8 +33,26 @@ pub fn run(
     addr: SocketAddr,
     world: &World,
     history: &History,
+    blockstore: &Blockstore,
     transactions_per_slot: usize,
 ) -> Result<(), String> {
+    // Read the history directly first, to tell storage problems apart from
+    // RPC ones.
+    let first = &history.transactions[0];
+    let stored = blockstore.get_rooted_transaction(first.signature);
+    check(matches!(stored, Ok(Some(_))), || {
+        format!(
+            "blockstore has no rooted transaction {} of slot {}: {:?}",
+            first.signature,
+            first.slot,
+            stored.map(|t| t.is_some())
+        )
+    })?;
+    let block = blockstore.get_rooted_block(first.slot, true);
+    check(block.is_ok(), || {
+        format!("blockstore has no rooted block {}: {:?}", first.slot, block.err())
+    })?;
+
     let mut connection = Connection::open(runtime, addr)?;
     let mut request = |body| connection.request(runtime, body);
     let tip = &history.tip;

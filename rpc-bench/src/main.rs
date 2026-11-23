@@ -361,6 +361,7 @@ fn main() {
         &blockstore,
         history_slots,
         transactions_per_slot,
+        nproc,
     );
     println!(
         "world accounts={} history_slots={} transactions={} executed={} failed={} tip_slot={}",
@@ -400,7 +401,7 @@ fn main() {
     let server = server::Server::start(
         identity,
         &history,
-        blockstore,
+        blockstore.clone(),
         &run_dir.join("ledger"),
         genesis_hash,
         rpc_config,
@@ -421,6 +422,7 @@ fn main() {
             server.addr,
             &world,
             &history,
+            &blockstore,
             transactions_per_slot,
         )
         .map(|()| println!("validate: all checks passed"))

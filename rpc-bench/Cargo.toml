@@ -17,6 +17,7 @@ agave-unstable-api = []
 agave-logger = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
+crossbeam-channel = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
@@ -49,6 +50,7 @@ solana-signature = { workspace = true }
 solana-signer = { workspace = true }
 solana-system-transaction = { workspace = true }
 solana-transaction = { workspace = true, features = ["wincode"] }
+solana-unified-scheduler-pool = { workspace = true, features = ["dev-context-only-utils"] }
 spl-associated-token-account-interface = { workspace = true }
 spl-memo-interface = { workspace = true }
 spl-token-2022-interface = { workspace = true }
