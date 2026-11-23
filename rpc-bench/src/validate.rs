@@ -38,16 +38,23 @@ pub fn run(
 ) -> Result<(), String> {
     // Read the history directly first, to tell storage problems apart from
     // RPC ones.
-    let first = &history.transactions[0];
-    let stored = blockstore.get_rooted_transaction(first.signature);
-    check(matches!(stored, Ok(Some(_))), || {
+    let missing: Vec<_> = history
+        .transactions
+        .iter()
+        .filter_map(|t| match blockstore.get_rooted_transaction(t.signature) {
+            Ok(Some(_)) => None,
+            other => Some(format!("{:?} in slot {}: {:?}", t.kind, t.slot, other.map(|t| t.is_some()))),
+        })
+        .collect();
+    check(missing.is_empty(), || {
         format!(
-            "blockstore has no rooted transaction {} of slot {}: {:?}",
-            first.signature,
-            first.slot,
-            stored.map(|t| t.is_some())
+            "blockstore is missing {} of {} history transactions, first: {}",
+            missing.len(),
+            history.transactions.len(),
+            missing[0]
         )
     })?;
+    let first = &history.transactions[0];
     let block = blockstore.get_rooted_block(first.slot, true);
     check(block.is_ok(), || {
         format!("blockstore has no rooted block {}: {:?}", first.slot, block.err())
