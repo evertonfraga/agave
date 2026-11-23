@@ -17,7 +17,7 @@ mod world;
 #[cfg(target_os = "linux")]
 use solana_clap_utils::input_parsers::parse_cpu_ranges;
 use {
-    clap::{App, Arg, value_t, value_t_or_exit},
+    clap::{App, Arg, ArgMatches, value_t_or_exit},
     requests::{Class, Mode},
     solana_account::{Account, ReadableAccount},
     solana_accounts_db::accounts_index::{AccountIndex, AccountSecondaryIndexes},
@@ -162,6 +162,16 @@ fn take_cores(
     taken
 }
 
+/// The value of an optional argument, or `default` if it is not given.
+/// Exits if the value does not parse.
+fn value_or<T: std::str::FromStr>(matches: &ArgMatches, name: &str, default: T) -> T {
+    if matches.is_present(name) {
+        value_t_or_exit!(matches, name, T)
+    } else {
+        default
+    }
+}
+
 fn parse_account_indexes(value: &str) -> AccountSecondaryIndexes {
     let indexes = if value == "none" {
         HashSet::new()
@@ -205,7 +215,7 @@ fn main() {
                 .long("requests")
                 .takes_value(true)
                 .help(
-                    "Number of measured requests [default: mixed 400000, light 2000000, medium \
+                    "Number of measured requests [default: mixed 400000, light 5000000, medium \
                      60000, heavy 3000, exec 300000]",
                 ),
         )
@@ -220,8 +230,10 @@ fn main() {
             Arg::with_name("concurrency")
                 .long("concurrency")
                 .takes_value(true)
-                .default_value("32")
-                .help("Number of connections, each with one request in flight"),
+                .help(
+                    "Number of connections, each with one request in flight [default: 32, light \
+                     128]",
+                ),
         )
         .arg(
             Arg::with_name("scale")
@@ -268,7 +280,7 @@ fn main() {
                 .takes_value(true)
                 .help(
                     "CPUs reserved for the client, rounded up to whole cores [default: max(2, \
-                     CPUs / 4)]",
+                     CPUs / 4), light max(2, CPUs / 2)]",
                 ),
         )
         .arg(
@@ -300,25 +312,26 @@ fn main() {
         "heavy" => Mode::Class(Class::Heavy),
         _ => Mode::Class(Class::Exec),
     };
-    let requests = value_t!(matches, "requests", usize).unwrap_or(mode.default_requests());
+    let requests = value_or(&matches, "requests", mode.default_requests());
     let seed = value_t_or_exit!(matches, "seed", u64);
-    let concurrency = value_t_or_exit!(matches, "concurrency", usize);
+    let concurrency = value_or(&matches, "concurrency", mode.default_concurrency());
     let small = matches.value_of("scale") == Some("small");
     let scale = if small { 20 } else { 1 };
-    let history_slots =
-        value_t!(matches, "history_slots", u64).unwrap_or(if small { 4 } else { 64 });
-    let transactions_per_slot =
-        value_t!(matches, "transactions_per_slot", usize).unwrap_or(if small { 100 } else { 600 });
+    let history_slots = value_or(&matches, "history_slots", if small { 4 } else { 64 });
+    let transactions_per_slot = value_or(
+        &matches,
+        "transactions_per_slot",
+        if small { 100 } else { 600 },
+    );
     let account_indexes = parse_account_indexes(matches.value_of("account_indexes").unwrap());
     let validate = matches.is_present("validate");
 
     let nproc = CpuSplit::new(0, false).all;
-    let client_cpus = value_t!(matches, "client_cpus", usize).unwrap_or((nproc / 4).max(2));
+    let client_cpus = value_or(&matches, "client_cpus", mode.default_client_cpus(nproc));
     let cpus = CpuSplit::new(client_cpus, !matches.is_present("no_pin"));
     let client_cpus = cpus.client_cpus(client_cpus);
-    let rpc_threads = value_t!(matches, "rpc_threads", usize).unwrap_or(cpus.server_cpus());
-    let rpc_blocking_threads =
-        value_t!(matches, "rpc_blocking_threads", usize).unwrap_or((nproc / 4).max(1));
+    let rpc_threads = value_or(&matches, "rpc_threads", cpus.server_cpus());
+    let rpc_blocking_threads = value_or(&matches, "rpc_blocking_threads", (nproc / 4).max(1));
 
     let data_dir = matches.value_of("data_dir").map_or_else(
         || {

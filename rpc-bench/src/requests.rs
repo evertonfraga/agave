@@ -48,10 +48,32 @@ impl Mode {
         match self {
             // Sized for 10-60 s on 8 vCPUs (Graviton4 with taskset -c 0-7).
             Mode::Mixed => 400_000,
-            Mode::Class(Class::Light) => 2_000_000,
+            Mode::Class(Class::Light) => 5_000_000,
             Mode::Class(Class::Medium) => 60_000,
             Mode::Class(Class::Heavy) => 3_000,
             Mode::Class(Class::Exec) => 300_000,
+        }
+    }
+
+    /// Connections of the measured pass. A light request costs the client
+    /// about two thirds of the CPU time it costs the server, and its latency
+    /// is mostly the loopback round trip. With 32 connections and 2 of 8
+    /// CPUs for the client, the server used under 40% of its CPUs. Light
+    /// mode keeps more requests in flight and gives the client half of the
+    /// CPUs, which keeps the server busy and the client under 70% (measured
+    /// on Graviton4 with 8 CPUs).
+    pub fn default_concurrency(self) -> usize {
+        match self {
+            Mode::Class(Class::Light) => 128,
+            _ => 32,
+        }
+    }
+
+    /// CPUs for the client out of `cpus`; see `default_concurrency`.
+    pub fn default_client_cpus(self, cpus: usize) -> usize {
+        match self {
+            Mode::Class(Class::Light) => (cpus / 2).max(2),
+            _ => (cpus / 4).max(2),
         }
     }
 
