@@ -167,6 +167,7 @@ deprecated = ["solana-stake-accounts", "solana-tokens", "agave-install-init"]
 dcou-tainted-packages = [
     "agave-conformance",
     "agave-ledger-tool",
+    "agave-rpc-bench",
     "agave-store-histogram",
     "agave-store-tool",
     "agave-votor-bench",
