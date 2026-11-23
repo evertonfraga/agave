@@ -1,5 +1,7 @@
 //! The BLS signature verifier.
 
+#[cfg(feature = "dev-context-only-utils")]
+use qualifier_attr::qualifiers;
 use {
     crate::{
         bls_cert_sigverify::{CertPayload, verify_and_send_certificates},
@@ -133,6 +135,7 @@ pub fn spawn_service(
         .unwrap()
 }
 
+#[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 struct SigVerifier {
     ban_sender: BanSender,
     channels: SigVerifierChannels,
@@ -154,6 +157,7 @@ struct SigVerifier {
 }
 
 impl SigVerifier {
+    #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
     fn new(context: SigVerifierContext, channels: SigVerifierChannels) -> Self {
         let SigVerifierContext {
             ban_sender,
@@ -184,6 +188,21 @@ impl SigVerifier {
             generated_cert_types,
             rank_map_cache: RankMapCache::default(),
         }
+    }
+
+    /// Verifies one batch of inputs on the calling thread, as one iteration of `run()` does.
+    ///
+    /// Benchmarks use this to control how inputs are split into batches.
+    #[cfg(feature = "dev-context-only-utils")]
+    pub fn verify_and_send_for_bench(
+        &mut self,
+        datagrams: &[Datagram],
+        certificates: Vec<(Slot, UnverifiedCertificate)>,
+    ) {
+        let my_pubkey = self.cluster_info.id();
+        let mut votes_buffer = HashMap::new();
+        self.verify_and_send_inputs(&my_pubkey, datagrams, &mut votes_buffer, certificates)
+            .expect("verify_and_send_inputs() failed");
     }
 
     fn run(mut self, exit: Arc<AtomicBool>) {

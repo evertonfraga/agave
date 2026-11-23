@@ -576,6 +576,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-votor-bench"
+version = "5.0.0-alpha.1"
+dependencies = [
+ "agave-bls-sigverify",
+ "agave-votor",
+ "agave-votor-messages",
+ "agave-votor-transport",
+ "bytes",
+ "clap 2.34.0",
+ "crossbeam-channel",
+ "rayon",
+ "solana-bls-signatures",
+ "solana-clock",
+ "solana-entry",
+ "solana-epoch-schedule",
+ "solana-gossip",
+ "solana-hash",
+ "solana-keypair",
+ "solana-ledger",
+ "solana-net-utils",
+ "solana-pubkey 4.4.0",
+ "solana-runtime",
+ "solana-signer",
+ "solana-streamer",
+ "wincode",
+]
+
+[[package]]
 name = "agave-votor-messages"
 version = "5.0.0-alpha.1"
 dependencies = [

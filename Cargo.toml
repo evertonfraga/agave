@@ -168,6 +168,7 @@ dcou-tainted-packages = [
     "agave-ledger-tool",
     "agave-store-histogram",
     "agave-store-tool",
+    "agave-votor-bench",
     "solana-banking-bench",
     "solana-local-cluster",
     "solana-svm-conformance",
