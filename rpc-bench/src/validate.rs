@@ -19,10 +19,13 @@ use {
 
 const FEE_PER_SIGNATURE: u64 = 5_000;
 
-/// Compute units used by every transaction of each history kind and each
-/// exec type. They do not depend on the seed, the scale or the architecture.
-/// Update them when the program binaries in solana-program-binaries or the
-/// compute unit costs change.
+/// Compute units of each history kind and each exec type. They are the same
+/// on every architecture. Programs compare addresses byte by byte, so a
+/// transaction uses a few more units when two of its random addresses share
+/// leading bytes: an ATA create whose payer and new account shared the first
+/// byte used 9 more. So the smallest value of several transactions must
+/// equal the table. Update the tables when the program binaries in
+/// solana-program-binaries or the compute unit costs change.
 const HISTORY_UNITS: [(TxKind, u64); 6] = [
     (TxKind::TokenTransfer, 376),
     (TxKind::SystemTransfer, 150),
@@ -31,6 +34,8 @@ const HISTORY_UNITS: [(TxKind, u64); 6] = [
     (TxKind::Swap { fail: false }, 20_255),
     (TxKind::Swap { fail: true }, 7_043),
 ];
+/// Transactions checked for each kind and type.
+const UNIT_SAMPLES: usize = 8;
 const EXEC_UNITS: [(&str, u64); 4] = [
     ("simulate.batch", 69_060),
     ("simulate.cpi", 48_444),
@@ -194,8 +199,9 @@ pub fn run(
             .transactions
             .iter()
             .filter(|t| t.kind == kind)
-            .take(4)
+            .take(UNIT_SAMPLES)
             .collect();
+        let mut units = vec![];
         check(!transactions.is_empty(), || {
             format!("no history transaction of kind {kind:?}")
         })?;
@@ -224,16 +230,15 @@ pub fn run(
                     format!("fee of {kind:?} is {}", meta["fee"])
                 })?;
             }
-            let units = &meta["computeUnitsConsumed"];
-            if units.as_u64() != Some(expected) {
-                unit_mismatches.push(format!(
-                    "history {kind:?} ({}) used {units}, expected {expected}",
-                    transaction.signature
-                ));
-            }
+            units.push(meta["computeUnitsConsumed"].as_u64().unwrap_or(0));
             if i == 0 {
-                println!("history kind={kind:?} units={units}");
+                println!("history kind={kind:?} units={}", units[0]);
             }
+        }
+        if units.iter().min() != Some(&expected) {
+            unit_mismatches.push(format!(
+                "history {kind:?} used {units:?}, expected {expected}"
+            ));
         }
     }
 
@@ -337,8 +342,9 @@ pub fn run(
         .filter(|t| t.name.starts_with("simulate."))
     {
         let expected = expected_units(&EXEC_UNITS, &request_type.name)?;
+        let mut units = vec![];
         // Swap bodies alternate between sigVerify and replaceRecentBlockhash.
-        for n in 0..4 {
+        for n in 0..UNIT_SAMPLES {
             let body = requests::exec_body(rng, world, request_type.name, n, blockhash);
             let result = request(body)?;
             let value = &result["value"];
@@ -351,16 +357,16 @@ pub fn run(
                     format!("{} returned no inner instructions", request_type.name)
                 })?;
             }
-            let units = &value["unitsConsumed"];
-            if units.as_u64() != Some(expected) {
-                unit_mismatches.push(format!(
-                    "{} body {n} used {units}, expected {expected}",
-                    request_type.name
-                ));
-            }
+            units.push(value["unitsConsumed"].as_u64().unwrap_or(0));
             if n == 0 {
-                println!("exec type={} units={units}", request_type.name);
+                println!("exec type={} units={}", request_type.name, units[0]);
             }
+        }
+        if units.iter().min() != Some(&expected) {
+            unit_mismatches.push(format!(
+                "{} used {units:?}, expected {expected}",
+                request_type.name
+            ));
         }
     }
     check(unit_mismatches.is_empty(), || {
