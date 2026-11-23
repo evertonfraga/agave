@@ -82,6 +82,7 @@ dependencies = [
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rayon",
+ "sha2 0.10.9",
  "solana-account",
  "solana-accounts-db",
  "solana-bls-signatures",
