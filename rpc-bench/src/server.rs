@@ -19,7 +19,7 @@ use {
     solana_signer::Signer,
     std::{
         collections::HashMap,
-        net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket},
+        net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
         path::Path,
         sync::{
             Arc, RwLock,
@@ -84,7 +84,8 @@ impl Server {
                 .unwrap()
                 .port();
             let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-            let tpu_client_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let tpu_client_socket =
+                solana_net_utils::sockets::bind_to(IpAddr::V4(Ipv4Addr::LOCALHOST), 0).unwrap();
             let config = JsonRpcServiceConfig {
                 rpc_addr: addr,
                 rpc_config: rpc_config.clone(),

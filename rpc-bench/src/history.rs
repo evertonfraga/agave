@@ -93,7 +93,6 @@ pub fn new_bank(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn build(
     rng: &mut ChaCha8Rng,
     world: &World,
@@ -156,7 +155,7 @@ pub fn build(
     );
 
     for slot in 1..=WARMUP_SLOTS + transaction_slots {
-        let bank = Bank::new_from_parent(parent.clone(), leader.clone(), slot);
+        let bank = Bank::new_from_parent(parent.clone(), leader, slot);
         let bank = bank_forks
             .write()
             .unwrap()

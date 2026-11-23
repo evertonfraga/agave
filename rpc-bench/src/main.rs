@@ -463,7 +463,6 @@ fn main() {
     exit(0);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn measure(
     runtime: &tokio::runtime::Runtime,
     server: &server::Server,

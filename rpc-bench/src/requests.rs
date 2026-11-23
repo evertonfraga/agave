@@ -246,7 +246,7 @@ pub fn exec_body(
     let kind = exec_kind(name);
     let owner = index(rng, world.active.len());
     let transaction = world.transaction(rng, kind, owner, blockhash);
-    let sig_verify = matches!(kind, TxKind::Swap { .. }) && n % 2 == 0;
+    let sig_verify = matches!(kind, TxKind::Swap { .. }) && n.is_multiple_of(2);
     simulate(
         &transaction,
         sig_verify,
