@@ -107,7 +107,10 @@ use {
     },
     solana_unified_scheduler_pool::DefaultSchedulerPool,
     spl_associated_token_account_interface::{
-        address::get_associated_token_address_with_program_id,
+        address::{
+            get_associated_token_address_and_bump_seed,
+            get_associated_token_address_with_program_id,
+        },
         instruction::create_associated_token_account_idempotent,
     },
     spl_token_interface::state::{Account as TokenAccount, AccountState, Mint},
@@ -145,6 +148,8 @@ const BLOCK_USER_AGENT: &[u8] = b"agave-block-bench";
 const FOOTER_TIME_STEP_NANOS: i64 = 200_000_000;
 /// Compute unit limit used when measuring the cost of each transaction class.
 const CALIBRATION_CU_LIMIT: u32 = 1_400_000;
+/// Transactions simulated per class for its mean compute units.
+const CALIBRATION_SAMPLES: usize = 32;
 // The constants below match turbine/src/sigverify_shreds.rs.
 const SIGVERIFY_LRU_CACHE_CAPACITY: usize = 1 << 18;
 const DEDUPER_NUM_BITS: u64 = 637_534_199;
@@ -593,6 +598,11 @@ struct World {
     token_2022_mints: Vec<Pubkey>,
     /// p-token account of payer `i`, for mint `i % NUM_TOKEN_MINTS`.
     token_accounts: Vec<Pubkey>,
+    /// The payer whose p-token account has the lowest bump seed. The ATA
+    /// program derives the account address by trying bump seeds from 255
+    /// down, at 1,500 compute units per extra seed, so this payer's ATA
+    /// transaction uses the most compute units of its class.
+    lowest_bump_payer: usize,
     /// Token-2022 account of payer `i`, for mint `i % NUM_TOKEN_2022_MINTS`.
     token_2022_accounts: Vec<Pubkey>,
     /// One p-token account per mint that many transfers go to.
@@ -704,17 +714,21 @@ fn build_world(config: &Config) -> World {
         .collect();
     let token_program = spl_token_interface::id();
     let token_2022_program = spl_token_2022_interface::id();
-    let token_accounts: Vec<Pubkey> = payers
+    let (token_accounts, token_account_bumps): (Vec<Pubkey>, Vec<u8>) = payers
         .par_iter()
         .enumerate()
         .map(|(i, payer)| {
-            get_associated_token_address_with_program_id(
+            get_associated_token_address_and_bump_seed(
                 &payer.pubkey(),
                 &token_mints[i % NUM_TOKEN_MINTS],
+                &spl_associated_token_account_interface::program::id(),
                 &token_program,
             )
         })
-        .collect();
+        .unzip();
+    let lowest_bump_payer = (0..config.payers)
+        .min_by_key(|&i| token_account_bumps[i])
+        .unwrap();
     let token_2022_accounts: Vec<Pubkey> = payers
         .par_iter()
         .enumerate()
@@ -813,6 +827,7 @@ fn build_world(config: &Config) -> World {
         token_mints,
         token_2022_mints,
         token_accounts,
+        lowest_bump_payer,
         token_2022_accounts,
         hot_accounts,
     }
@@ -994,15 +1009,17 @@ struct TxPlan {
 
 /// Per-class compute units, measured once at setup by simulation.
 struct Calibration {
+    /// Mean compute units of the class, used for the block estimates.
     units: BTreeMap<TxClass, u64>,
+    /// Compute units of the costliest transaction of the class.
+    max_units: BTreeMap<TxClass, u64>,
     heavy_memo_len: usize,
 }
 
 impl Calibration {
     fn cu_limit(&self, class: TxClass) -> u32 {
-        // Give each class 25% more than it used, plus room for the memo
-        // length to vary.
-        let units = self.units.get(&class).copied().unwrap_or(200_000);
+        // 25% more than the costliest transaction of the class, plus 1,000.
+        let units = self.max_units[&class];
         (units + units / 4 + 1_000).min(u64::from(CALIBRATION_CU_LIMIT)) as u32
     }
 }
@@ -1227,9 +1244,10 @@ impl Generator<'_> {
             .collect()
     }
 
-    /// Measures the compute units of each class by simulating one transaction
-    /// of each on `bank`. Programs deployed at genesis are only visible from
-    /// slot 1, so `bank` is a child of bank 0.
+    /// Measures the compute units of each class by simulation on `bank`: the
+    /// mean over `CALIBRATION_SAMPLES` transactions drawn the way blocks draw
+    /// them, and the costliest transaction of the class. Programs deployed at
+    /// genesis are only visible from slot 1, so `bank` is a child of bank 0.
     fn calibrate(&self, bank: &Bank) -> Calibration {
         let config = self.config;
         let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
@@ -1246,15 +1264,8 @@ impl Generator<'_> {
             wincode_size(&self.build(&plan, CALIBRATION_CU_LIMIT, blockhash)) <= PACKET_DATA_SIZE
         );
 
-        let mut units = BTreeMap::new();
-        for class in TxClass::ALL {
-            let mut plan = self.plan_class(&mut rng, class, 1, 2);
-            match class {
-                TxClass::Memo => plan.memo = self.memo(&mut rng, config.memo_bytes.1),
-                TxClass::Heavy => plan.memo = self.memo(&mut rng, heavy_memo_len),
-                _ => (),
-            }
-            let transaction = self.build(&plan, CALIBRATION_CU_LIMIT, blockhash);
+        let simulate = |plan: &TxPlan| {
+            let transaction = self.build(plan, CALIBRATION_CU_LIMIT, blockhash);
             let size = wincode_size(&transaction);
             let transaction = RuntimeTransaction::<SanitizedTransaction>::try_create(
                 transaction,
@@ -1267,19 +1278,55 @@ impl Generator<'_> {
             if let Err(err) = &result.result {
                 panic!(
                     "calibration transaction of class {} failed: {err}, logs: {:?}",
-                    class.name(),
+                    plan.class.name(),
                     result.logs
                 );
             }
+            (result.units_consumed, size)
+        };
+
+        let mut units = BTreeMap::new();
+        let mut max_units = BTreeMap::new();
+        for class in TxClass::ALL {
+            let mut total = 0;
+            let mut max = 0;
+            for _ in 0..CALIBRATION_SAMPLES {
+                let payers = sample(&mut rng, config.payers, 2);
+                let mut plan = self.plan_class(&mut rng, class, payers.index(0), payers.index(1));
+                if class == TxClass::Heavy {
+                    plan.memo = self.memo(&mut rng, heavy_memo_len);
+                }
+                let (cu, _) = simulate(&plan);
+                total += cu;
+                max = max.max(cu);
+            }
+            // The costliest transaction has the longest memo, or for ATA the
+            // payer with the lowest bump seed. Sampling would miss that payer:
+            // each extra seed is needed by half as many payers as the one
+            // before.
+            let (payer, other) = match class {
+                TxClass::Ata => (self.world.lowest_bump_payer, self.world.lowest_bump_payer),
+                _ => (0, 1),
+            };
+            let mut plan = self.plan_class(&mut rng, class, payer, other);
+            match class {
+                TxClass::Memo => plan.memo = self.memo(&mut rng, config.memo_bytes.1),
+                TxClass::Heavy => plan.memo = self.memo(&mut rng, heavy_memo_len),
+                _ => (),
+            }
+            let (cu, size) = simulate(&plan);
+            let mean = total / CALIBRATION_SAMPLES as u64;
+            let max = max.max(cu);
             println!(
-                "CALIBRATION class={} cu={} size={size}",
-                class.name(),
-                result.units_consumed
+                "CALIBRATION class={} cu={mean} max_cu={max} size={size}",
+                class.name()
             );
-            units.insert(class, result.units_consumed);
+            units.insert(class, mean);
+            max_units.insert(class, max);
         }
         Calibration {
             units,
+            max_units,
             heavy_memo_len,
         }
     }
