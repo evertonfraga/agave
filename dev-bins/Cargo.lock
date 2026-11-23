@@ -583,6 +583,7 @@ dependencies = [
  "agave-votor",
  "agave-votor-messages",
  "agave-votor-transport",
+ "bytes",
  "clap 2.34.0",
  "crossbeam-channel",
  "rayon",

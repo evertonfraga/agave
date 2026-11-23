@@ -19,6 +19,7 @@ agave-bls-sigverify = { workspace = true, features = ["dev-context-only-utils"] 
 agave-votor = { workspace = true }
 agave-votor-messages = { workspace = true }
 agave-votor-transport = { workspace = true, features = ["dev-context-only-utils"] }
+bytes = { workspace = true }
 clap = { workspace = true }
 crossbeam-channel = { workspace = true }
 rayon = { workspace = true }
