@@ -55,7 +55,13 @@ impl Server {
         let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::new(
             HashMap::new(),
             tip.total_epoch_stake(),
-            CommitmentSlots::new_from_slot(tip_slot),
+            // The tip is the root, so every commitment level resolves to it.
+            CommitmentSlots {
+                slot: tip_slot,
+                root: tip_slot,
+                highest_confirmed_slot: tip_slot,
+                highest_super_majority_root: tip_slot,
+            },
         )));
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&history.bank_forks);
