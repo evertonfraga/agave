@@ -937,6 +937,9 @@ struct ReplayStats {
     drain_us: u64,
     freeze_us: u64,
     execute_timings: ExecuteTimings,
+    /// Transactions that were committed with an error, such as running out
+    /// of compute units. They pay fees but skip the rest of their work.
+    num_failed_txs: u64,
 }
 
 /// How replay finishes a slot.
@@ -1475,6 +1478,7 @@ fn generate_blocks(
             .map(|plan| calibration.units[&plan.class])
             .sum();
         let num_sigs = transactions.iter().map(|tx| tx.signatures.len()).sum();
+        let signatures: Vec<_> = transactions.iter().map(|tx| tx.signatures[0]).collect();
 
         let mut entries = Vec::new();
         let mut last_hash = blockhash;
@@ -1606,6 +1610,18 @@ fn generate_blocks(
             &mut stats,
         )
         .unwrap_or_else(|err| panic!("generated slot {slot} failed to replay: {err}"));
+        // A failed transaction still pays its fee and the block stays valid,
+        // but the transaction skips the work its class stands for.
+        if stats.num_failed_txs > 0 {
+            let first_failure = plans.iter().zip(&signatures).find_map(|(plan, signature)| {
+                let status = bank.get_signature_status_with_blockhash(signature, &blockhash)?;
+                status.err().map(|err| (plan.class.name(), err))
+            });
+            panic!(
+                "generated slot {slot} has {} failed transactions, the first: {first_failure:?}",
+                stats.num_failed_txs
+            );
+        }
         let bank_hash = bank.hash();
         let cost_units = bank.read_cost_tracker().unwrap().block_cost();
 
@@ -1891,6 +1907,7 @@ fn replay_bank(
         Finish::Discover => bank.freeze(),
     }
     stats.freeze_us += start.elapsed().as_micros() as u64;
+    stats.num_failed_txs += bank.transaction_error_count();
 
     stats.fetch_us += timing.fetch_elapsed;
     stats.confirmation_us += timing.confirmation_elapsed;
@@ -2206,6 +2223,15 @@ fn run_checks(
             measured.bank_hash_mismatches
         ),
     );
+    if config.mode.runs_replay() {
+        check(
+            measured.replay.num_failed_txs == 0,
+            format!(
+                "failed transactions in the measured slots: {}",
+                measured.replay.num_failed_txs
+            ),
+        );
+    }
 
     // A flipped byte changes the Merkle root, so the leader signature fails.
     let first = &blocks[0];
@@ -2465,9 +2491,11 @@ fn main() {
             .sum::<usize>() as f64
             / num_blocks as f64
     };
+    // Generation fails on any failed transaction, so the blocks of
+    // --mode shreds, which the measured pass does not replay, have none.
     println!(
         "SHAPE: txs={:.1} sigs={:.1} entries={:.1} batches={:.1} fec_sets={:.1} shreds={:.1} \
-         dropped_data={:.1} entry_bytes={:.0} estimated_cu={:.0} cost_units={:.0}",
+         dropped_data={:.1} entry_bytes={:.0} estimated_cu={:.0} cost_units={:.0} failed_txs={}",
         average(|block| block.num_txs),
         average(|block| block.num_sigs),
         average(|block| block.num_entries),
@@ -2486,6 +2514,7 @@ fn main() {
             .map(|block| block.cost_units)
             .sum::<u64>() as f64
             / num_blocks as f64,
+        measured.replay.num_failed_txs,
     );
     let receive = &measured.receive;
     if config.mode.runs_receive() {
