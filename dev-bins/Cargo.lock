@@ -461,8 +461,11 @@ dependencies = [
  "solana-pubkey 4.4.0",
  "solana-rent",
  "solana-rpc",
+ "solana-rpc-client-api",
  "solana-runtime",
+ "solana-sdk-ids",
  "solana-send-transaction-service",
+ "solana-signature",
  "solana-signer",
  "solana-system-transaction",
  "solana-transaction",
@@ -473,6 +476,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-util 0.7.19",
+ "wincode",
 ]
 
 [[package]]
