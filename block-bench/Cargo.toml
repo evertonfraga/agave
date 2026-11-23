@@ -24,7 +24,6 @@ agave-worker-pool = { workspace = true }
 bitvec = { workspace = true }
 clap = { version = "3.2.23", default-features = false, features = ["cargo", "std", "suggestions"] }
 jemallocator = { workspace = true }
-log = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 rayon = { workspace = true }
@@ -62,6 +61,7 @@ spl-memo-interface = { workspace = true }
 spl-token-2022-interface = { workspace = true }
 spl-token-interface = { workspace = true }
 tempfile = { workspace = true }
+wincode = { workspace = true }
 
 [lints]
 workspace = true
