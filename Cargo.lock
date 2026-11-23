@@ -70,6 +70,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "agave-block-bench"
+version = "5.0.0-alpha.1"
+dependencies = [
+ "agave-feature-set",
+ "agave-logger",
+ "agave-votor-messages",
+ "agave-worker-pool",
+ "bitvec",
+ "clap 3.2.23",
+ "log",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rayon",
+ "solana-account",
+ "solana-accounts-db",
+ "solana-bls-signatures",
+ "solana-clock",
+ "solana-cluster-type",
+ "solana-compute-budget-interface",
+ "solana-entry",
+ "solana-epoch-schedule",
+ "solana-fee-calculator",
+ "solana-genesis-config",
+ "solana-hash",
+ "solana-keypair",
+ "solana-ledger",
+ "solana-message",
+ "solana-perf",
+ "solana-program-binaries",
+ "solana-program-pack",
+ "solana-pubkey 4.4.0",
+ "solana-rent",
+ "solana-runtime",
+ "solana-runtime-transaction",
+ "solana-sha256-hasher",
+ "solana-shred-version",
+ "solana-signer",
+ "solana-signer-store",
+ "solana-svm-timings",
+ "solana-system-interface",
+ "solana-transaction",
+ "solana-unified-scheduler-pool",
+ "spl-associated-token-account-interface",
+ "spl-memo-interface",
+ "spl-token-2022-interface",
+ "spl-token-interface",
+ "tempfile",
+ "tikv-jemallocator",
+]
+
+[[package]]
 name = "agave-bls-cert-verify"
 version = "5.0.0-alpha.1"
 dependencies = [
