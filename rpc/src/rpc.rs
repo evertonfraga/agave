@@ -4866,6 +4866,29 @@ pub fn populate_blockstore_for_tests(
     blockstore: Arc<Blockstore>,
     max_complete_transaction_status_slot: Arc<AtomicU64>,
 ) {
+    populate_blockstore_for_tests_with_config(
+        entries,
+        bank,
+        blockstore,
+        max_complete_transaction_status_slot,
+        crate::transaction_status_service::TransactionStatusServiceConfig {
+            enable_rpc_transaction_history: true,
+            ..crate::transaction_status_service::TransactionStatusServiceConfig::default_for_tests()
+        },
+    );
+}
+
+/// Like [`populate_blockstore_for_tests`], but writes transaction statuses
+/// with the given `TransactionStatusServiceConfig`, for example to keep log
+/// messages and inner instructions with `enable_extended_tx_metadata_storage`.
+#[cfg(feature = "dev-context-only-utils")]
+pub fn populate_blockstore_for_tests_with_config(
+    entries: Vec<Entry>,
+    bank: Arc<Bank>,
+    blockstore: Arc<Blockstore>,
+    max_complete_transaction_status_slot: Arc<AtomicU64>,
+    config: crate::transaction_status_service::TransactionStatusServiceConfig,
+) {
     use crossbeam_channel::bounded;
 
     let slot = bank.slot();
@@ -4883,10 +4906,7 @@ pub fn populate_blockstore_for_tests(
             max_complete_transaction_status_slot,
             Arc::new(AtomicU64::default()),
             blockstore,
-            crate::transaction_status_service::TransactionStatusServiceConfig {
-                enable_rpc_transaction_history: true,
-                ..crate::transaction_status_service::TransactionStatusServiceConfig::default_for_tests()
-            },
+            config,
             tss_exit.clone(),
             None,
         );
