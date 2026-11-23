@@ -4,6 +4,7 @@ members = [
     "../conformance",
     "../ledger-tool",
     "../svm-conformance",
+    "../votor-bench",
 ]
 
 resolver = "2"
@@ -37,12 +38,15 @@ used_underscore_binding = "deny"
 new_without_default = "allow"
 
 [workspace.dependencies]
+agave-bls-sigverify = { path = "../bls-sigverify", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 agave-feature-set = { path = "../feature-set", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 agave-logger = { path = "../logger", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 agave-reserved-account-keys = { path = "../reserved-account-keys", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 agave-snapshots = { path = "../snapshots", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 agave-transaction-view = "10.0.0"
+agave-votor = { path = "../votor", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 agave-votor-messages = { path = "../votor-messages", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+agave-votor-transport = { path = "../votor-transport", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 ahash = "0.8.11"
 assert_cmd = "2.2.2"
 bv = "0.11.1"
@@ -99,6 +103,7 @@ solana-loader-v3-interface = "9.0.0"
 solana-measure = { path = "../measure", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-message = "6.0.0"
 solana-native-token = "3.0.0"
+solana-net-utils = { path = "../net-utils", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-packet = "4.2.0"
 solana-program-runtime = { path = "../program-runtime", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-pubkey = { version = "4.2.0", default-features = false }
@@ -119,6 +124,7 @@ solana-slot-history = "3.2.0"
 solana-stake-history = "2.1.0"
 solana-stake-interface = "5.1.0"
 solana-storage-bigtable = { path = "../storage-bigtable", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
+solana-streamer = { path = "../streamer", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-svm = { path = "../svm", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-svm-callback = { path = "../svm-callback", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }
 solana-svm-feature-set = { path = "../svm-feature-set", version = "=5.0.0-alpha.1", features = ["agave-unstable-api"] }

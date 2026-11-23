@@ -1,0 +1,41 @@
+[package]
+name = "agave-votor-bench"
+description = "Benchmark for the Alpenglow consensus message verification of one validator"
+publish = false
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+workspace = "../dev-bins"
+
+[features]
+agave-unstable-api = []
+dev-context-only-utils = []
+
+[dependencies]
+agave-bls-sigverify = { workspace = true, features = ["dev-context-only-utils"] }
+agave-votor = { workspace = true }
+agave-votor-messages = { workspace = true }
+agave-votor-transport = { workspace = true, features = ["dev-context-only-utils"] }
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+rayon = { workspace = true }
+solana-bls-signatures = { workspace = true }
+solana-clock = { workspace = true }
+solana-entry = { workspace = true }
+solana-epoch-schedule = { workspace = true }
+solana-gossip = { workspace = true }
+solana-hash = { workspace = true }
+solana-keypair = { workspace = true }
+solana-ledger = { workspace = true }
+solana-net-utils = { workspace = true }
+solana-pubkey = { workspace = true }
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
+solana-signer = { workspace = true }
+solana-streamer = { workspace = true }
+wincode = { workspace = true }
+
+[lints]
+workspace = true
