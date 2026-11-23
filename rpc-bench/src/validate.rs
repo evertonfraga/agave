@@ -148,7 +148,14 @@ pub fn run(
         let failed = kind == TxKind::Swap { fail: true };
         check(
             meta["err"].is_null() != failed && len(&meta["logMessages"]) > 0,
-            || format!("getTransaction for {kind:?} returned meta {meta}"),
+            || {
+                let text = result.to_string();
+                format!(
+                    "getTransaction for {kind:?} ({}) returned {}",
+                    transaction.signature,
+                    &text[..text.len().min(1_500)]
+                )
+            },
         )?;
         if matches!(kind, TxKind::CreateAta(_)) {
             check(len(&meta["innerInstructions"]) > 0, || {
