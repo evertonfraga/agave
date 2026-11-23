@@ -17,7 +17,7 @@ mod world;
 use {
     clap::{App, Arg, value_t, value_t_or_exit},
     requests::{Class, Mode},
-    solana_account::Account,
+    solana_account::{Account, ReadableAccount},
     solana_accounts_db::accounts_index::{AccountIndex, AccountSecondaryIndexes},
     solana_epoch_schedule::EpochSchedule,
     solana_fee_calculator::FeeRateGovernor,
@@ -348,10 +348,19 @@ fn main() {
             .entry(address)
             .or_insert_with(|| Account::from(account));
     }
-    world.add_genesis_accounts(&mut rng, &rent, &mut genesis_config.accounts);
     let genesis_hash = genesis.genesis_config.hash();
 
+    // The world is too large for a genesis config, whose serialized size is
+    // limited, so it is stored into the root bank instead. Stores update the
+    // secondary indexes like any other write.
     let bank = history::new_bank(&genesis, &run_dir.join("accounts"), &account_indexes);
+    let accounts = world.accounts(&mut rng, &rent);
+    let lamports: u64 = accounts.iter().map(|(_, account)| account.lamports()).sum();
+    for chunk in accounts.chunks(10_000) {
+        bank.store_accounts((bank.slot(), chunk), None);
+    }
+    bank.set_capitalization_for_tests(bank.capitalization() + lamports);
+    drop(accounts);
     let blockstore = Arc::new(Blockstore::open(&run_dir.join("ledger")).unwrap());
     let history = history::build(
         &mut rng,

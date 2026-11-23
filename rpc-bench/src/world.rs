@@ -6,7 +6,7 @@ use {
         ChaCha8Rng,
         rand_core::{RngCore, SeedableRng},
     },
-    solana_account::Account,
+    solana_account::{Account, AccountSharedData},
     solana_compute_budget_interface::ComputeBudgetInstruction,
     solana_hash::Hash,
     solana_instruction::Instruction,
@@ -17,7 +17,6 @@ use {
     solana_signer::Signer,
     solana_transaction::Transaction,
     spl_token_interface::state::{Account as TokenAccount, AccountState, Mint},
-    std::collections::BTreeMap,
 };
 
 pub const TOKEN_DECIMALS: u8 = 6;
@@ -272,19 +271,15 @@ impl World {
         }
     }
 
-    /// Adds every world account to `accounts`. The scan account data is drawn
-    /// here, and the POSITION count per market is recorded for the checks.
-    pub fn add_genesis_accounts(
-        &mut self,
-        rng: &mut ChaCha8Rng,
-        rent: &Rent,
-        accounts: &mut BTreeMap<Pubkey, Account>,
-    ) {
+    /// Returns every world account. The scan account data is drawn here,
+    /// and the POSITION count per market is recorded for the checks.
+    pub fn accounts(&mut self, rng: &mut ChaCha8Rng, rent: &Rent) -> Vec<(Pubkey, AccountSharedData)> {
+        let mut accounts = Vec::with_capacity(self.num_accounts());
         for (wallet, lamports) in self.wallets.iter().zip(&self.wallet_lamports) {
-            accounts.insert(
+            accounts.push((
                 *wallet,
                 owned(*lamports, vec![], &solana_sdk_ids::system_program::id()),
-            );
+            ));
         }
         let token_lamports = rent.minimum_balance(TokenAccount::LEN);
         let mint_lamports = rent.minimum_balance(Mint::LEN);
@@ -304,11 +299,11 @@ impl World {
         ] {
             for (mint, holders) in mints.iter().zip(mint_holders) {
                 let supply = TOKEN_BALANCE * holders.len() as u64;
-                accounts.insert(*mint, owned(mint_lamports, mint_data(supply), &program));
+                accounts.push((*mint, owned(mint_lamports, mint_data(supply), &program)));
             }
             for holding in holdings {
                 let data = token_account_data(&mints[holding.mint], &holding.owner, TOKEN_BALANCE);
-                accounts.insert(holding.address, owned(token_lamports, data, &program));
+                accounts.push((holding.address, owned(token_lamports, data, &program)));
             }
         }
 
@@ -324,15 +319,13 @@ impl World {
                 self.scan_positions[market] += 1;
             }
             data[8..40].copy_from_slice(self.markets[market].as_ref());
-            accounts.insert(*address, owned(scan_lamports, data, &self.scan_program));
+            accounts.push((*address, owned(scan_lamports, data, &self.scan_program)));
         }
         let pool_lamports = rent.minimum_balance(POOL_ACCOUNT_SIZE);
         for (address, data) in self.pool_accounts.iter().zip(&self.pool_data) {
-            accounts.insert(
-                *address,
-                owned(pool_lamports, data.clone(), &self.pool_program),
-            );
+            accounts.push((*address, owned(pool_lamports, data.clone(), &self.pool_program)));
         }
+        accounts
     }
 
     pub fn num_accounts(&self) -> usize {
@@ -506,14 +499,14 @@ pub enum TxKind {
     Batch { transfers: usize, fail: bool },
 }
 
-fn owned(lamports: u64, data: Vec<u8>, owner: &Pubkey) -> Account {
-    Account {
+fn owned(lamports: u64, data: Vec<u8>, owner: &Pubkey) -> AccountSharedData {
+    AccountSharedData::from(Account {
         lamports,
         data,
         owner: *owner,
         executable: false,
         rent_epoch: 0,
-    }
+    })
 }
 
 fn holders(holdings: &[TokenHolding], num_mints: usize) -> Vec<Vec<usize>> {
