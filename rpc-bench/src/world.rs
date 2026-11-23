@@ -50,6 +50,25 @@ pub fn new_pubkey(rng: &mut ChaCha8Rng) -> Pubkey {
     Pubkey::new_from_array(bytes)
 }
 
+/// A new wallet whose Token-2022 associated token account for `mint` is
+/// found at the first bump seed. The ATA program pays compute units for
+/// every bump seed it tries, so this gives every create the same cost.
+fn new_ata_wallet(rng: &mut ChaCha8Rng, mint: &Pubkey) -> Pubkey {
+    loop {
+        let wallet = new_pubkey(rng);
+        let (_, bump) =
+            spl_associated_token_account_interface::address::get_associated_token_address_and_bump_seed(
+                &wallet,
+                mint,
+                &spl_associated_token_account_interface::program::id(),
+                &spl_token_2022_interface::id(),
+            );
+        if bump == u8::MAX {
+            return wallet;
+        }
+    }
+}
+
 fn new_keypair(rng: &mut ChaCha8Rng) -> Keypair {
     let mut bytes = [0u8; 32];
     rng.fill_bytes(&mut bytes);
@@ -448,7 +467,7 @@ impl World {
                     instructions.push(
                         spl_associated_token_account_interface::instruction::create_associated_token_account_idempotent(
                             &self.wallets[owner],
-                            &new_pubkey(rng),
+                            &new_ata_wallet(rng, mint),
                             mint,
                             &spl_token_2022_interface::id(),
                         ),

@@ -19,8 +19,38 @@ use {
 
 const FEE_PER_SIGNATURE: u64 = 5_000;
 
+/// Compute units used by every transaction of each history kind and each
+/// exec type. They do not depend on the seed, the scale or the architecture.
+/// Update them when the program binaries in solana-program-binaries or the
+/// compute unit costs change.
+const HISTORY_UNITS: [(TxKind, u64); 6] = [
+    (TxKind::TokenTransfer, 376),
+    (TxKind::SystemTransfer, 150),
+    (TxKind::T22TransferMemo, 25_902),
+    (TxKind::CreateAta(1), 16_148),
+    (TxKind::Swap { fail: false }, 20_255),
+    (TxKind::Swap { fail: true }, 7_043),
+];
+const EXEC_UNITS: [(&str, u64); 4] = [
+    ("simulate.batch", 69_060),
+    ("simulate.cpi", 48_444),
+    ("simulate.swap", 20_255),
+    ("simulate.fail", 68_623),
+];
+
 fn check(ok: bool, what: impl FnOnce() -> String) -> Result<(), String> {
     if ok { Ok(()) } else { Err(what()) }
+}
+
+fn expected_units<K: PartialEq + std::fmt::Debug>(
+    table: &[(K, u64)],
+    key: &K,
+) -> Result<u64, String> {
+    table
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, units)| *units)
+        .ok_or_else(|| format!("no expected compute units for {key:?}"))
 }
 
 fn len(value: &Value) -> usize {
@@ -155,40 +185,56 @@ pub fn run(
         "getSignatureStatuses did not return 64 statuses".to_string()
     })?;
 
+    // Compute unit mismatches are collected, so that one run shows every
+    // value to update.
+    let mut unit_mismatches = vec![];
     for (kind, _) in HISTORY_MIX {
-        let transaction = history
+        let expected = expected_units(&HISTORY_UNITS, &kind)?;
+        let transactions: Vec<_> = history
             .transactions
             .iter()
-            .find(|t| t.kind == kind)
-            .ok_or_else(|| format!("no history transaction of kind {kind:?}"))?;
-        let result = request(requests::get_transaction(&transaction.signature))?;
-        let meta = &result["meta"];
-        let failed = kind == TxKind::Swap { fail: true };
-        check(
-            meta["err"].is_null() != failed && len(&meta["logMessages"]) > 0,
-            || {
-                let text = result.to_string();
-                format!(
-                    "getTransaction for {kind:?} ({}) returned {}",
-                    transaction.signature,
-                    &text[..text.len().min(1_500)]
-                )
-            },
-        )?;
-        if matches!(kind, TxKind::CreateAta(_)) {
-            check(len(&meta["innerInstructions"]) > 0, || {
-                format!("getTransaction for {kind:?} has no inner instructions")
-            })?;
+            .filter(|t| t.kind == kind)
+            .take(4)
+            .collect();
+        check(!transactions.is_empty(), || {
+            format!("no history transaction of kind {kind:?}")
+        })?;
+        for (i, transaction) in transactions.iter().enumerate() {
+            let result = request(requests::get_transaction(&transaction.signature))?;
+            let meta = &result["meta"];
+            let failed = kind == TxKind::Swap { fail: true };
+            check(
+                meta["err"].is_null() != failed && len(&meta["logMessages"]) > 0,
+                || {
+                    let text = result.to_string();
+                    format!(
+                        "getTransaction for {kind:?} ({}) returned {}",
+                        transaction.signature,
+                        &text[..text.len().min(1_500)]
+                    )
+                },
+            )?;
+            if matches!(kind, TxKind::CreateAta(_)) {
+                check(len(&meta["innerInstructions"]) > 0, || {
+                    format!("getTransaction for {kind:?} has no inner instructions")
+                })?;
+            }
+            if matches!(kind, TxKind::SystemTransfer | TxKind::T22TransferMemo) {
+                check(meta["fee"] == FEE_PER_SIGNATURE, || {
+                    format!("fee of {kind:?} is {}", meta["fee"])
+                })?;
+            }
+            let units = &meta["computeUnitsConsumed"];
+            if units.as_u64() != Some(expected) {
+                unit_mismatches.push(format!(
+                    "history {kind:?} ({}) used {units}, expected {expected}",
+                    transaction.signature
+                ));
+            }
+            if i == 0 {
+                println!("history kind={kind:?} units={units}");
+            }
         }
-        if matches!(kind, TxKind::SystemTransfer | TxKind::T22TransferMemo) {
-            check(meta["fee"] == FEE_PER_SIGNATURE, || {
-                format!("fee of {kind:?} is {}", meta["fee"])
-            })?;
-        }
-        println!(
-            "history kind={kind:?} units={}",
-            meta["computeUnitsConsumed"]
-        );
     }
 
     for owner in [0, world.active.len() / 2, world.active.len() - 1] {
@@ -290,27 +336,38 @@ pub fn run(
         .iter()
         .filter(|t| t.name.starts_with("simulate."))
     {
-        for n in 0..2 {
+        let expected = expected_units(&EXEC_UNITS, &request_type.name)?;
+        // Swap bodies alternate between sigVerify and replaceRecentBlockhash.
+        for n in 0..4 {
             let body = requests::exec_body(rng, world, request_type.name, n, blockhash);
             let result = request(body)?;
             let value = &result["value"];
             let should_fail = request_type.name == "simulate.fail";
-            check(
-                value["err"].is_null() != should_fail && value["unitsConsumed"].as_u64() > Some(0),
-                || format!("{} returned {value}", request_type.name),
-            )?;
+            check(value["err"].is_null() != should_fail, || {
+                format!("{} returned {value}", request_type.name)
+            })?;
             if request_type.name == "simulate.cpi" {
                 check(len(&value["innerInstructions"]) > 0, || {
                     format!("{} returned no inner instructions", request_type.name)
                 })?;
             }
+            let units = &value["unitsConsumed"];
+            if units.as_u64() != Some(expected) {
+                unit_mismatches.push(format!(
+                    "{} body {n} used {units}, expected {expected}",
+                    request_type.name
+                ));
+            }
             if n == 0 {
-                println!(
-                    "exec type={} units={}",
-                    request_type.name, value["unitsConsumed"]
-                );
+                println!("exec type={} units={units}", request_type.name);
             }
         }
     }
-    Ok(())
+    check(unit_mismatches.is_empty(), || {
+        format!(
+            "unexpected compute units: {}. If the program binaries or the compute unit costs \
+             changed, update HISTORY_UNITS and EXEC_UNITS in validate.rs",
+            unit_mismatches.join("; ")
+        )
+    })
 }
