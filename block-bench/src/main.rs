@@ -772,7 +772,7 @@ fn build_world(config: &Config) -> World {
     for (i, payer) in payers.iter().enumerate() {
         genesis_config.add_account(
             payer.pubkey(),
-            AccountSharedData::new(PAYER_LAMPORTS, 0, &system_program::id()),
+            AccountSharedData::empty(PAYER_LAMPORTS, &system_program::id()),
         );
         genesis_config.add_account(
             token_accounts[i],
@@ -825,8 +825,8 @@ fn build_world(config: &Config) -> World {
 /// A bank chain with its blockstore, as replay sees it.
 struct Chain {
     bank_forks: Arc<RwLock<BankForks>>,
-    leader_schedule_cache: LeaderScheduleCache,
-    blockstore: Blockstore,
+    leader_schedule_cache: Arc<LeaderScheduleCache>,
+    blockstore: Arc<Blockstore>,
 }
 
 fn create_ledger(path: &Path, genesis_config: &GenesisConfig) -> Blockstore {
@@ -844,7 +844,7 @@ fn create_ledger(path: &Path, genesis_config: &GenesisConfig) -> Blockstore {
 /// from the slot 0 shreds, then it is frozen.
 fn new_chain(
     genesis_config: &GenesisConfig,
-    blockstore: Blockstore,
+    blockstore: Arc<Blockstore>,
     accounts_dir: PathBuf,
     handler_threads: usize,
 ) -> Chain {
@@ -879,7 +879,7 @@ fn new_chain(
         .expect("slot 0 has a block id");
     bank0.set_block_id(Some(BlockId::from(block_id)));
     bank0.freeze();
-    let leader_schedule_cache = LeaderScheduleCache::new_from_bank(&bank0);
+    let leader_schedule_cache = Arc::new(LeaderScheduleCache::new_from_bank(&bank0));
     Chain {
         bank_forks,
         leader_schedule_cache,
@@ -2326,7 +2326,7 @@ fn main() {
     println!(
         "FEATURES: active={} inactive={} id={} stricter_shred_validation={}",
         active_features.len(),
-        bank0.feature_set.inactive().count(),
+        bank0.feature_set.inactive().len(),
         hashv(&feature_bytes),
         bank0
             .feature_set
