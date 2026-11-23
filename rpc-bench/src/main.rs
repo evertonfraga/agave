@@ -184,8 +184,8 @@ fn main() {
                 .long("requests")
                 .takes_value(true)
                 .help(
-                    "Number of measured requests [default: mixed 400000, light 1000000, medium \
-                     60000, heavy 3000, exec 60000]",
+                    "Number of measured requests [default: mixed 400000, light 2000000, medium \
+                     60000, heavy 3000, exec 300000]",
                 ),
         )
         .arg(
@@ -384,7 +384,10 @@ fn main() {
     );
 
     let pools = Arc::new(requests::build_pools(&mut rng, &world, &history, scale));
-    let warmup_requests = (requests / 20).clamp(2_000, 20_000);
+    // The warmup fills the program cache, the read cache and the RocksDB
+    // caches. A tenth of the run is enough; a fixed minimum would make the
+    // heavy warmup longer than the heavy run.
+    let warmup_requests = (requests / 10).clamp(100, 20_000);
     let warmup = Arc::new(requests::sequence(
         &mut world::new_rng(seed + 1),
         mode,

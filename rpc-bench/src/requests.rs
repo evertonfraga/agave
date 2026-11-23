@@ -46,11 +46,12 @@ pub enum Mode {
 impl Mode {
     pub fn default_requests(self) -> usize {
         match self {
+            // Sized for 10-60 s on 8 vCPUs (Graviton4 with taskset -c 0-7).
             Mode::Mixed => 400_000,
-            Mode::Class(Class::Light) => 1_000_000,
+            Mode::Class(Class::Light) => 2_000_000,
             Mode::Class(Class::Medium) => 60_000,
             Mode::Class(Class::Heavy) => 3_000,
-            Mode::Class(Class::Exec) => 60_000,
+            Mode::Class(Class::Exec) => 300_000,
         }
     }
 
