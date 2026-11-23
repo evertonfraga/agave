@@ -283,7 +283,7 @@ impl World {
         for (wallet, lamports) in self.wallets.iter().zip(&self.wallet_lamports) {
             accounts.insert(
                 *wallet,
-                Account::new(*lamports, 0, &solana_sdk_ids::system_program::id()),
+                owned(*lamports, vec![], &solana_sdk_ids::system_program::id()),
             );
         }
         let token_lamports = rent.minimum_balance(TokenAccount::LEN);
@@ -431,7 +431,8 @@ impl World {
                 return solana_system_transaction::transfer(signer, to, 1_000_000, blockhash);
             }
             TxKind::T22TransferMemo => {
-                instructions.push(self.t22_transfer(rng, owner, 0, range(rng, 1, 1_000)));
+                let amount = range(rng, 1, 1_000);
+                instructions.push(self.t22_transfer(rng, owner, 0, amount));
                 instructions.push(Self::memo(rng, 64));
             }
             TxKind::CreateAta(count) => {

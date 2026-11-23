@@ -10,8 +10,7 @@ use {
         accounts_db::{ACCOUNTS_DB_CONFIG_FOR_BENCHMARKS, AccountsDbConfig},
         accounts_index::AccountSecondaryIndexes,
     },
-    solana_entry::entry::{Entry, next_entry},
-    solana_hash::Hash,
+    solana_entry::entry::next_entry,
     solana_leader_schedule::SlotLeader,
     solana_ledger::blockstore::Blockstore,
     solana_pubkey::Pubkey,
@@ -142,7 +141,8 @@ pub fn build(
             .insert(bank)
             .clone_without_scheduler();
         let entries = if slot <= WARMUP_SLOTS {
-            vec![Entry::new_tick(1, &Hash::new_from_array([slot as u8; 32]))]
+            // One tick entry; the remaining ticks are registered below.
+            vec![next_entry(&parent.last_blockhash(), 1, vec![])]
         } else {
             let window = &blockhashes[blockhashes.len().saturating_sub(MAX_RECENT_BLOCKHASHES)..];
             let transactions: Vec<_> = (0..transactions_per_slot)

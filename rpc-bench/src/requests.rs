@@ -310,22 +310,29 @@ pub fn build_pools(
                 .collect(),
             "getMultipleAccounts" => (0..pool(4_096))
                 .map(|_| {
-                    let addresses: Vec<_> = (0..60)
-                        .map(|_| keys.token_account(rng, world))
-                        .chain((0..30).map(|_| keys.wallet(rng, world)))
-                        .chain((0..10).map(|_| keys.pool_account(rng, world)))
-                        .collect();
+                    let mut addresses = Vec::with_capacity(100);
+                    for _ in 0..60 {
+                        addresses.push(keys.token_account(rng, world));
+                    }
+                    for _ in 0..30 {
+                        addresses.push(keys.wallet(rng, world));
+                    }
+                    for _ in 0..10 {
+                        addresses.push(keys.pool_account(rng, world));
+                    }
                     get_multiple_accounts(&addresses)
                 })
                 .collect(),
             "getSignatureStatuses" => (0..pool(4_096))
                 .map(|_| {
-                    let signatures: Vec<_> = (0..48)
-                        .map(|_| {
-                            history.transactions[index(rng, history.transactions.len())].signature
-                        })
-                        .chain((0..16).map(|_| random_signature(rng)))
-                        .collect();
+                    let mut signatures = Vec::with_capacity(64);
+                    for _ in 0..48 {
+                        let transaction = index(rng, history.transactions.len());
+                        signatures.push(history.transactions[transaction].signature);
+                    }
+                    for _ in 0..16 {
+                        signatures.push(random_signature(rng));
+                    }
                     get_signature_statuses(&signatures)
                 })
                 .collect(),
