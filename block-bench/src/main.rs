@@ -232,9 +232,15 @@ impl TxClass {
 /// Mix presets. The weights are percentages of `--txs`.
 ///
 /// `mainnet` follows the measured mainnet shares where this benchmark has a
-/// matching class. The design also lists ATA creation for new owners (3%) and
-/// v0 transactions through lookup tables (15%); those are not generated yet
-/// and their share is folded into `token` and `transfer`.
+/// matching class. Mainnet also has ATA creation for new owners (about 3%)
+/// and v0 transactions through lookup tables (about 15%); those are not
+/// generated yet and their share is folded into `token` and `transfer`.
+///
+/// Memos default to 16-64 bytes (`--memo-bytes`), the size of typical
+/// mainnet memos such as payment references. Memo v3 costs about 350 compute
+/// units per byte, so memos of a few hundred bytes would make memo execution
+/// most of the replay time. Execution-heavy blocks come from `cu20m`, whose
+/// tail is memos as long as a packet allows.
 const MIX_MAINNET: &str = "transfer=13,token=45,token2022=5,ata=20,memo=12,two-signer=5";
 const MIX_TRANSFER: &str = "transfer=50,token=50";
 /// `cu20m` is the mainnet mix plus heavy memo transactions up to this target.
@@ -394,7 +400,7 @@ fn parse_args() -> Config {
             Arg::new("memo_bytes")
                 .long("memo-bytes")
                 .takes_value(true)
-                .default_value("200-500")
+                .default_value("16-64")
                 .help("Memo length of the memo class, drawn uniformly from MIN-MAX"),
         )
         .arg(
