@@ -346,8 +346,8 @@ fn parse_args() -> Config {
                 .long("cu-target")
                 .takes_value(true)
                 .help(
-                    "Add heavy memo transactions until the estimated consumed compute units \
-                     per block reach this value [default: 20000000 for --mix cu20m, else 0]",
+                    "Add heavy memo transactions until the estimated consumed compute units per \
+                     block reach this value [default: 20000000 for --mix cu20m, else 0]",
                 ),
         )
         .arg(
@@ -447,15 +447,9 @@ fn parse_args() -> Config {
                 .long("no-reward-cert")
                 .help("Leave out the notarization reward certificate for slot S-8"),
         )
-        .arg(
-            Arg::new("threads")
-                .long("threads")
-                .takes_value(true)
-                .help(
-                    "Thread count the other thread defaults derive from [default: available \
-                     parallelism]",
-                ),
-        )
+        .arg(Arg::new("threads").long("threads").takes_value(true).help(
+            "Thread count the other thread defaults derive from [default: available parallelism]",
+        ))
         .arg(
             Arg::new("handler_threads")
                 .long("handler-threads")
@@ -735,7 +729,9 @@ fn build_world(config: &Config) -> World {
     let hot_accounts: Vec<Pubkey> = hot_owners
         .iter()
         .zip(&token_mints)
-        .map(|(owner, mint)| get_associated_token_address_with_program_id(owner, mint, &token_program))
+        .map(|(owner, mint)| {
+            get_associated_token_address_with_program_id(owner, mint, &token_program)
+        })
         .collect();
 
     // Token-2022 accounts without extensions have the same layout as p-token
@@ -1029,23 +1025,21 @@ impl Generator<'_> {
             ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
             ComputeBudgetInstruction::set_compute_unit_price(self.config.cu_price),
         ];
-        let token_transfer = |program: &Pubkey,
-                              accounts: &[Pubkey],
-                              mints: &[Pubkey],
-                              destination: Pubkey| {
-            let mint = mints[plan.payer % mints.len()];
-            spl_token_interface::instruction::transfer_checked(
-                program,
-                &accounts[plan.payer],
-                &mint,
-                &destination,
-                &payer.pubkey(),
-                &[],
-                plan.amount,
-                TOKEN_DECIMALS,
-            )
-            .unwrap()
-        };
+        let token_transfer =
+            |program: &Pubkey, accounts: &[Pubkey], mints: &[Pubkey], destination: Pubkey| {
+                let mint = mints[plan.payer % mints.len()];
+                spl_token_interface::instruction::transfer_checked(
+                    program,
+                    &accounts[plan.payer],
+                    &mint,
+                    &destination,
+                    &payer.pubkey(),
+                    &[],
+                    plan.amount,
+                    TOKEN_DECIMALS,
+                )
+                .unwrap()
+            };
         let token_destination = || {
             if plan.hot {
                 world.hot_accounts[plan.payer % NUM_TOKEN_MINTS]
@@ -1139,10 +1133,18 @@ impl Generator<'_> {
         }
     }
 
-    fn plan_class(&self, rng: &mut ChaCha8Rng, class: TxClass, payer: usize, other: usize) -> TxPlan {
+    fn plan_class(
+        &self,
+        rng: &mut ChaCha8Rng,
+        class: TxClass,
+        payer: usize,
+        other: usize,
+    ) -> TxPlan {
         let config = self.config;
         let destination = match class {
-            TxClass::Token | TxClass::Ata => self.same_mint_destination(rng, payer, NUM_TOKEN_MINTS),
+            TxClass::Token | TxClass::Ata => {
+                self.same_mint_destination(rng, payer, NUM_TOKEN_MINTS)
+            }
             TxClass::Token2022 => self.same_mint_destination(rng, payer, NUM_TOKEN_2022_MINTS),
             _ => {
                 let destination = rng.random_range(0..config.payers);
@@ -1192,12 +1194,12 @@ impl Generator<'_> {
             })
             .collect();
         if config.cu_target > 0 {
-            let estimated: u64 = classes
-                .iter()
-                .map(|class| calibration.units[class])
-                .sum();
+            let estimated: u64 = classes.iter().map(|class| calibration.units[class]).sum();
             let heavy_units = calibration.units[&TxClass::Heavy].max(1);
-            let heavy = config.cu_target.saturating_sub(estimated).div_ceil(heavy_units);
+            let heavy = config
+                .cu_target
+                .saturating_sub(estimated)
+                .div_ceil(heavy_units);
             classes.extend((0..heavy).map(|_| TxClass::Heavy));
         }
         let needed: usize = classes.iter().map(|class| class.num_payers()).sum();
@@ -1240,7 +1242,9 @@ impl Generator<'_> {
         // The memo length prefix grows from 1 to 2 bytes past 127 bytes.
         let heavy_memo_len = PACKET_DATA_SIZE - base_size - 1;
         plan.memo = self.memo(&mut rng, heavy_memo_len);
-        assert!(wincode_size(&self.build(&plan, CALIBRATION_CU_LIMIT, blockhash)) <= PACKET_DATA_SIZE);
+        assert!(
+            wincode_size(&self.build(&plan, CALIBRATION_CU_LIMIT, blockhash)) <= PACKET_DATA_SIZE
+        );
 
         let mut units = BTreeMap::new();
         for class in TxClass::ALL {
@@ -1522,10 +1526,8 @@ fn generate_blocks(
             next_shred_index: 0,
             next_code_index: 0,
         };
-        let header = BlockComponent::new_block_header(
-            slot - 1,
-            BlockId::from(block_ids[slot as usize - 1]),
-        );
+        let header =
+            BlockComponent::new_block_header(slot - 1, BlockId::from(block_ids[slot as usize - 1]));
         let mut shreds = shredder.shred(keypair, &header, false);
         for batch in batches {
             shreds.extend(shredder.shred(keypair, &BlockComponent::EntryBatch(batch), false));
@@ -1543,7 +1545,10 @@ fn generate_blocks(
 
         let (placeholder_tail, _) = shred_tail(Hash::default());
         let placeholder: Vec<Shred> = shreds.iter().cloned().chain(placeholder_tail).collect();
-        generation.blockstore.insert_shreds(placeholder, true).unwrap();
+        generation
+            .blockstore
+            .insert_shreds(placeholder, true)
+            .unwrap();
         let mut stats = ReplayStats::default();
         replay_bank(
             generation,
@@ -1560,7 +1565,9 @@ fn generate_blocks(
 
         let (tail, last_fec_root) = shred_tail(bank_hash);
         shreds.extend(tail);
-        final_blockstore.insert_shreds(shreds.clone(), true).unwrap();
+        final_blockstore
+            .insert_shreds(shreds.clone(), true)
+            .unwrap();
         let block_id = final_blockstore
             .get_block_id(slot, &migration_status)
             .unwrap()
@@ -1759,7 +1766,10 @@ fn print_sha256_side_measurements(blocks: &[BlockData]) {
         "BENCH_PHASE:side_shred_merkle_1t:{:.6}",
         seconds(merkle_elapsed)
     );
-    println!("BENCH_PHASE:side_sha256_64b_1m:{:.6}", seconds(hash_elapsed));
+    println!(
+        "BENCH_PHASE:side_sha256_64b_1m:{:.6}",
+        seconds(hash_elapsed)
+    );
 }
 
 /// Stage D on an existing bank: the sequence of `process_single_slot`, with
@@ -1976,7 +1986,11 @@ fn run_measured(
                     num_jobs += 1;
                 }
                 let mut outputs: Vec<SigverifyOutput> = (0..num_jobs)
-                    .map(|_| sigverify_pool.recv().expect("shred sigverify worker failed"))
+                    .map(|_| {
+                        sigverify_pool
+                            .recv()
+                            .expect("shred sigverify worker failed")
+                    })
                     .collect();
                 // Keep the arrival order fixed so every run inserts shreds in
                 // the same order.
@@ -2217,7 +2231,10 @@ fn run_checks(
             &mut ReplayStats::default(),
         );
         check(
-            matches!(result, Err(BlockstoreProcessorError::BankHashMismatch(2, ..))),
+            matches!(
+                result,
+                Err(BlockstoreProcessorError::BankHashMismatch(2, ..))
+            ),
             format!(
                 "a wrong footer bank hash gives BankHashMismatch: {:?}",
                 result.err()
@@ -2397,7 +2414,11 @@ fn main() {
         .collect();
     let num_blocks = measured_blocks.len().max(1);
     let average = |get: fn(&BlockData) -> usize| {
-        measured_blocks.iter().map(|block| get(block)).sum::<usize>() as f64 / num_blocks as f64
+        measured_blocks
+            .iter()
+            .map(|block| get(block))
+            .sum::<usize>() as f64
+            / num_blocks as f64
     };
     println!(
         "SHAPE: txs={:.1} sigs={:.1} entries={:.1} batches={:.1} fec_sets={:.1} shreds={:.1} \
@@ -2473,14 +2494,20 @@ fn main() {
         print_phase("freeze", replay.freeze_us);
         // Thread time summed over the scheduler handler threads.
         print_phase("exec_load_thread", metrics[ExecuteTimingType::LoadUs].0);
-        print_phase("exec_execute_thread", metrics[ExecuteTimingType::ExecuteUs].0);
+        print_phase(
+            "exec_execute_thread",
+            metrics[ExecuteTimingType::ExecuteUs].0,
+        );
         print_phase("exec_store_thread", metrics[ExecuteTimingType::StoreUs].0);
         bench_result_us += total(|t| t.replay);
     }
     print_sha256_side_measurements(&blocks[blocks.len() - measured_blocks.len()..]);
     println!(
         "FINAL_BANK_HASH:{}",
-        blocks.last().map(|block| block.bank_hash).unwrap_or_default()
+        blocks
+            .last()
+            .map(|block| block.bank_hash)
+            .unwrap_or_default()
     );
     println!("BENCH_RESULT:{:.6}", micros(bench_result_us));
 
