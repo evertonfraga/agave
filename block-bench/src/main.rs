@@ -1237,12 +1237,13 @@ impl Generator<'_> {
     }
 
     /// Measures the compute units of each class by simulating one transaction
-    /// of each on the frozen bank 0.
-    fn calibrate(&self, bank0: &Bank) -> Calibration {
+    /// of each on `bank`. Programs deployed at genesis are only visible from
+    /// slot 1, so `bank` is a child of bank 0.
+    fn calibrate(&self, bank: &Bank) -> Calibration {
         let config = self.config;
         let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
         rng.set_stream(u64::MAX);
-        let blockhash = bank0.last_blockhash();
+        let blockhash = bank.last_blockhash();
 
         // The longest memo that keeps the transaction within a packet.
         let mut plan = self.plan_class(&mut rng, TxClass::Heavy, 0, 0);
@@ -1265,11 +1266,11 @@ impl Generator<'_> {
             let transaction = RuntimeTransaction::<SanitizedTransaction>::try_create(
                 transaction,
                 MessageHash::Compute,
-                bank0,
-                bank0.get_reserved_account_keys(),
+                bank,
+                bank.get_reserved_account_keys(),
             )
             .unwrap();
-            let result = bank0.simulate_transaction(&transaction, false);
+            let result = bank.simulate_transaction_unchecked(&transaction, false);
             if let Err(err) = &result.result {
                 panic!(
                     "calibration transaction of class {} failed: {err}, logs: {:?}",
@@ -2339,8 +2340,16 @@ fn main() {
         config: &config,
         world: &world,
     };
-    let calibration = generator.calibrate(&bank0);
-    drop(bank0);
+    // Calibrate on a bank for a slot after the generated range. It is never
+    // inserted into the forks, and simulation stores nothing.
+    let calibration = {
+        let slot = config.warmup + config.slots + 2 * NUM_SLOTS_FOR_REWARD;
+        let leader = generation
+            .leader_schedule_cache
+            .slot_leader_at(slot, Some(&bank0))
+            .unwrap();
+        generator.calibrate(&Bank::new_from_parent(bank0, leader, slot))
+    };
 
     let start = Instant::now();
     let blocks = generate_blocks(
