@@ -928,17 +928,6 @@ struct ReplayStats {
     execute_timings: ExecuteTimings,
 }
 
-impl ReplayStats {
-    fn consumed_cu(&self) -> u64 {
-        self.execute_timings
-            .details
-            .per_program_timings
-            .values()
-            .map(|timing| timing.accumulated_units.0)
-            .sum()
-    }
-}
-
 /// How replay finishes a slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Finish {
@@ -1312,7 +1301,10 @@ struct BlockData {
     num_batches: usize,
     num_fec_sets: usize,
     entry_bytes: usize,
-    consumed_cu: u64,
+    /// Sum of the calibrated compute units of the block's transactions.
+    estimated_cu: u64,
+    /// Block cost from the cost tracker after replay.
+    cost_units: u64,
 }
 
 /// Aggregates the notarization votes of every voter, in rank order, for one
@@ -1428,6 +1420,10 @@ fn generate_blocks(
             .map(|plan| generator.build(plan, calibration.cu_limit(plan.class), blockhash))
             .collect();
         let num_txs = transactions.len();
+        let estimated_cu = plans
+            .iter()
+            .map(|plan| calibration.units[&plan.class])
+            .sum();
         let num_sigs = transactions.iter().map(|tx| tx.signatures.len()).sum();
 
         let mut entries = Vec::new();
@@ -1560,6 +1556,7 @@ fn generate_blocks(
         )
         .unwrap_or_else(|err| panic!("generated slot {slot} failed to replay: {err}"));
         let bank_hash = bank.hash();
+        let cost_units = bank.read_cost_tracker().unwrap().block_cost();
 
         let (tail, last_fec_root) = shred_tail(bank_hash);
         shreds.extend(tail);
@@ -1601,7 +1598,8 @@ fn generate_blocks(
             num_batches,
             num_fec_sets: fec_sets.len(),
             entry_bytes,
-            consumed_cu: stats.consumed_cu(),
+            estimated_cu,
+            cost_units,
             shreds,
         });
     }
@@ -2403,7 +2401,7 @@ fn main() {
     };
     println!(
         "SHAPE: txs={:.1} sigs={:.1} entries={:.1} batches={:.1} fec_sets={:.1} shreds={:.1} \
-         dropped_data={:.1} entry_bytes={:.0} consumed_cu={:.0}",
+         dropped_data={:.1} entry_bytes={:.0} estimated_cu={:.0} cost_units={:.0}",
         average(|block| block.num_txs),
         average(|block| block.num_sigs),
         average(|block| block.num_entries),
@@ -2414,7 +2412,12 @@ fn main() {
         average(|block| block.entry_bytes),
         measured_blocks
             .iter()
-            .map(|block| block.consumed_cu)
+            .map(|block| block.estimated_cu)
+            .sum::<u64>() as f64
+            / num_blocks as f64,
+        measured_blocks
+            .iter()
+            .map(|block| block.cost_units)
             .sum::<u64>() as f64
             / num_blocks as f64,
     );
@@ -2472,7 +2475,6 @@ fn main() {
         print_phase("exec_load_thread", metrics[ExecuteTimingType::LoadUs].0);
         print_phase("exec_execute_thread", metrics[ExecuteTimingType::ExecuteUs].0);
         print_phase("exec_store_thread", metrics[ExecuteTimingType::StoreUs].0);
-        println!("REPLAY: consumed_cu_per_block={:.0}", replay.consumed_cu() as f64 / num_blocks as f64);
         bench_result_us += total(|t| t.replay);
     }
     print_sha256_side_measurements(&blocks[blocks.len() - measured_blocks.len()..]);
