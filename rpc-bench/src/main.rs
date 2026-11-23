@@ -14,6 +14,8 @@ mod stats;
 mod validate;
 mod world;
 
+#[cfg(target_os = "linux")]
+use solana_clap_utils::input_parsers::parse_cpu_ranges;
 use {
     clap::{App, Arg, value_t, value_t_or_exit},
     requests::{Class, Mode},
@@ -52,42 +54,28 @@ impl CpuSplit {
     fn new(client_cpus: usize, pin: bool) -> Self {
         let allowed = agave_cpu_utils::cpu_affinity(None).unwrap();
         let all = allowed.len();
-        if !pin || client_cpus >= all {
-            return Self {
-                all,
-                server: vec![],
-                client: vec![],
-            };
-        }
-        let siblings = |cpu: &agave_cpu_utils::CpuId| {
-            fs::read_to_string(format!(
-                "/sys/devices/system/cpu/cpu{}/topology/thread_siblings_list",
-                **cpu
-            ))
-            .unwrap_or_else(|_| cpu.to_string())
+        let unpinned = Self {
+            all,
+            server: vec![],
+            client: vec![],
         };
-        let mut client = vec![];
-        let mut client_cores = vec![];
-        for cpu in allowed.iter().rev() {
-            let core = siblings(cpu);
-            if client.len() < client_cpus || client_cores.contains(&core) {
-                client.push(*cpu);
-                client_cores.push(core);
-            }
+        if !pin || client_cpus >= all {
+            return unpinned;
         }
-        let server: Vec<_> = allowed
-            .iter()
-            .filter(|cpu| !client.contains(cpu))
-            .copied()
-            .collect();
+        let ids: Vec<usize> = allowed.iter().map(|cpu| **cpu).collect();
+        let client = take_cores(&ids, client_cpus, |cpu| {
+            fs::read_to_string(format!(
+                "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+            ))
+            .ok()
+            .and_then(|list| parse_cpu_ranges(list.trim()).ok())
+            .unwrap_or_else(|| vec![cpu])
+        });
+        let (client, server): (Vec<_>, Vec<_>) =
+            allowed.into_iter().partition(|cpu| client.contains(cpu));
         if server.is_empty() {
-            return Self {
-                all,
-                server: vec![],
-                client: vec![],
-            };
+            return unpinned;
         }
-        client.sort_by_key(|cpu| **cpu);
         Self {
             all,
             server,
@@ -108,6 +96,16 @@ impl CpuSplit {
             return self.server.len();
         }
         self.all
+    }
+
+    /// The number of client CPUs, which is `requested` rounded up to whole
+    /// cores when the CPUs are split.
+    fn client_cpus(&self, requested: usize) -> usize {
+        #[cfg(target_os = "linux")]
+        if !self.client.is_empty() {
+            return self.client.len();
+        }
+        requested
     }
 
     fn describe(&self) -> String {
@@ -139,6 +137,29 @@ impl CpuSplit {
         #[cfg(not(target_os = "linux"))]
         let _ = server;
     }
+}
+
+/// Takes whole cores from the end of `allowed` until at least `count` CPUs
+/// are taken. `siblings` returns the CPUs of the core that a CPU belongs to.
+/// Their numbering depends on the machine: cpu0 shares a core with cpu1 on
+/// some, and with cpu4 on an 8-vCPU AWS Intel instance.
+#[cfg(target_os = "linux")]
+fn take_cores(
+    allowed: &[usize],
+    count: usize,
+    siblings: impl Fn(usize) -> Vec<usize>,
+) -> Vec<usize> {
+    let mut taken = vec![];
+    for &cpu in allowed.iter().rev() {
+        if taken.len() >= count {
+            break;
+        }
+        if !taken.contains(&cpu) {
+            let core = siblings(cpu);
+            taken.extend(allowed.iter().filter(|other| core.contains(other)));
+        }
+    }
+    taken
 }
 
 fn parse_account_indexes(value: &str) -> AccountSecondaryIndexes {
@@ -245,7 +266,10 @@ fn main() {
             Arg::with_name("client_cpus")
                 .long("client-cpus")
                 .takes_value(true)
-                .help("CPUs reserved for the client [default: max(2, CPUs / 4)]"),
+                .help(
+                    "CPUs reserved for the client, rounded up to whole cores [default: max(2, \
+                     CPUs / 4)]",
+                ),
         )
         .arg(
             Arg::with_name("no_pin")
@@ -291,6 +315,7 @@ fn main() {
     let nproc = CpuSplit::new(0, false).all;
     let client_cpus = value_t!(matches, "client_cpus", usize).unwrap_or((nproc / 4).max(2));
     let cpus = CpuSplit::new(client_cpus, !matches.is_present("no_pin"));
+    let client_cpus = cpus.client_cpus(client_cpus);
     let rpc_threads = value_t!(matches, "rpc_threads", usize).unwrap_or(cpus.server_cpus());
     let rpc_blocking_threads =
         value_t!(matches, "rpc_blocking_threads", usize).unwrap_or((nproc / 4).max(1));
@@ -494,4 +519,31 @@ fn measure(
     stats::report_cpu(workers, &start, &end, outcome.elapsed, client_cpus);
     println!("BENCH_RESULT:{:.6}", outcome.elapsed.as_secs_f64());
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn client_of_8(count: usize, siblings: impl Fn(usize) -> Vec<usize>) -> Vec<usize> {
+        let allowed: Vec<usize> = (0..8).collect();
+        let mut client = take_cores(&allowed, count, siblings);
+        client.sort_unstable();
+        client
+    }
+
+    #[test]
+    fn test_take_cores() {
+        // One CPU per core, as on Graviton and c8a.
+        assert_eq!(client_of_8(2, |cpu| vec![cpu]), [6, 7]);
+        // Siblings N and N + 4, as on an 8-vCPU AWS Intel instance.
+        let intel = |cpu: usize| vec![cpu % 4, cpu % 4 + 4];
+        assert_eq!(client_of_8(2, intel), [3, 7]);
+        assert_eq!(client_of_8(3, intel), [2, 3, 6, 7]);
+        // Adjacent siblings.
+        assert_eq!(client_of_8(2, |cpu| vec![cpu & !1, cpu | 1]), [6, 7]);
+        // Siblings outside the allowed set are not taken.
+        let allowed = [0, 1, 2, 3];
+        assert_eq!(take_cores(&allowed, 2, intel), [3, 2]);
+    }
 }

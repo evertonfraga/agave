@@ -445,6 +445,7 @@ dependencies = [
  "serde_json",
  "solana-account",
  "solana-accounts-db",
+ "solana-clap-utils",
  "solana-compute-budget-interface",
  "solana-entry",
  "solana-epoch-schedule",

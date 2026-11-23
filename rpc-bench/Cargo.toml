@@ -60,6 +60,7 @@ wincode = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 agave-cpu-utils = { workspace = true }
+solana-clap-utils = { workspace = true }
 
 [target.'cfg(not(any(target_env = "msvc", target_os = "freebsd")))'.dependencies]
 jemallocator = { workspace = true }
