@@ -210,3 +210,6 @@ codegen-units = 1
 [patch.crates-io]
 librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
 rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
+# solana-bls-signatures 4.0.2 from crates.io, vendored to try changes to its signature
+# verification before they are released. See the commit that added vendor/solana-bls-signatures.
+solana-bls-signatures = { path = "../vendor/solana-bls-signatures" }
