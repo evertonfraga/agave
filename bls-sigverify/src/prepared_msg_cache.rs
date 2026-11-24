@@ -9,7 +9,7 @@ use {
 ///
 /// Each prepared message owns a pairing preparation table of 19,584 bytes. With the hashed point
 /// and the allocation, an entry takes about 19.8 KB, so a full cache holds about 5 MB.
-const MAX_PREPARED_MSGS: usize = 256;
+pub(crate) const MAX_PREPARED_MSGS: usize = 256;
 
 /// Prepared messages of recent vote payloads.
 ///
