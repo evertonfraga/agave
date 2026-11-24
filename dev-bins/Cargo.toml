@@ -186,5 +186,10 @@ lto = "fat"
 codegen-units = 1
 
 [patch.crates-io]
+# solana-sbpf 0.28.0 plus the parrot JIT with its aarch64 backend, vendored (see ../Cargo.toml) so that agave runs sBPF
+# programs JIT-compiled on aarch64 Linux. The library code (src/) is anza-xyz/sbpf PR #314 at
+# 158b87669078a867f959ccf7c75fcb73fe0adf87 (v0.28.0 + #262 + the parrot stack #264, #311, #312,
+# #313, #305, #314), unchanged; one more commit (654f8ba) only adds tests and fuzzer checks.
+solana-sbpf = { path = "../vendor/solana-sbpf" }
 librocksdb-sys = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
 rocksdb = { git = "https://github.com/anza-xyz/rust-rocksdb", rev = "4dba80dfe9434e595a971f5b2985ff9ba4fb31e7" }
