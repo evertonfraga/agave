@@ -904,7 +904,7 @@ mod tests {
         super::*,
         crate::accounts_file::new_scan_accounts_reader,
         error::{ReadDataEntryError, ReadMetaEntryError},
-        meta::META_ENTRY_INLINE_DATA_MAX_SIZE,
+        meta::{META_ENTRY_FIRST_READ_SIZE, META_ENTRY_INLINE_DATA_MAX_SIZE},
         solana_account::accounts_equal,
         solana_pubkey::Pubkey,
         std::{assert_matches, iter},
@@ -1251,6 +1251,57 @@ mod tests {
                     })
                     .unwrap();
             }
+        }
+    }
+
+    /// Ensure accounts whose meta entries are shorter than, as long as, or longer than the first
+    /// read of a meta entry are read whole.
+    #[test]
+    fn test_write_and_read_accounts_first_read_boundary() {
+        let temp_dir = TempDir::new().unwrap();
+        let split = SplitFile::new(temp_dir.path().join("base")).unwrap();
+        let owner = Pubkey::new_unique();
+        let first_read_data_len = META_ENTRY_FIRST_READ_SIZE - META_ENTRY_FIXED_SIZE;
+        // the last account's meta entry ends the meta file
+        let accounts: Vec<_> = [
+            first_read_data_len - 1,
+            first_read_data_len,
+            first_read_data_len + 1,
+            META_ENTRY_INLINE_DATA_MAX_SIZE,
+            first_read_data_len + 1,
+        ]
+        .into_iter()
+        .map(|data_len| {
+            (
+                Pubkey::new_unique(),
+                AccountSharedData::new_with_data(
+                    100,
+                    rand::random_iter().take(data_len).collect(),
+                    &owner,
+                ),
+            )
+        })
+        .collect();
+        let (logical_offsets, _) = split.write_accounts(&(0, accounts.as_slice())).unwrap();
+
+        for ((address, account), logical_offset) in accounts.iter().zip(logical_offsets) {
+            let loaded_account = split
+                .get_account_shared_data_if(logical_offset, |_, _, _| true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&loaded_account, account);
+            split
+                .get_account_with_data(logical_offset, |stored_account| {
+                    assert_eq!(stored_account.pubkey, address);
+                    assert!(accounts_equal(&stored_account, account));
+                })
+                .unwrap();
+            split
+                .get_account_without_data(logical_offset, |stored_account| {
+                    assert_eq!(stored_account.pubkey, address);
+                    assert_eq!(stored_account.data_len, account.data().len());
+                })
+                .unwrap();
         }
     }
 
