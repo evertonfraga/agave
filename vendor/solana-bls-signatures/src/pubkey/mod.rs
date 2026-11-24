@@ -42,7 +42,7 @@ pub use {
         AddToPubkeyProjective, AggregatePubkey, AsPubkeyAffine, AsPubkeyProjective, PopVerified,
         PubkeyAffine, PubkeyAffineUnchecked, PubkeyProjective,
     },
-    verify::{VerifyPop, VerifySignature},
+    verify::{MillerLoop, VerifyPop, VerifySignature},
 };
 
 #[cfg(test)]
