@@ -147,6 +147,15 @@ impl PartialEq for ProgramCacheEntry {
     }
 }
 
+/// Whether programs are JIT-compiled on aarch64 Linux: yes, unless the environment variable
+/// `AGAVE_AARCH64_SBPF_JIT` is `0`, which keeps every program in the interpreter.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+fn aarch64_jit_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("AGAVE_AARCH64_SBPF_JIT").as_deref() != Ok("0"));
+    *ENABLED
+}
+
 impl ProgramCacheEntry {
     /// Creates a loaded user program
     pub fn load(
@@ -183,6 +192,27 @@ impl ProgramCacheEntry {
             #[cfg(feature = "metrics")]
             {
                 metrics.jit_compile_us = jit_compile_time;
+            }
+        }
+
+        // On aarch64 Linux the parrot JIT of solana-sbpf compiles the program. Unlike the x86_64
+        // JIT above, a failure to compile does not fail the load: the program stays with the
+        // interpreter, which is how aarch64 ran every program before.
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        if aarch64_jit_enabled() {
+            let jit_compile_time = solana_svm_measure::measure::Measure::start("jit_compile_time");
+            match executable.parrot_compile() {
+                Ok(()) => {
+                    let jit_compile_time = jit_compile_time.end_as_us();
+                    entry_stats.jit_compiled(jit_compile_time);
+                    #[cfg(feature = "metrics")]
+                    {
+                        metrics.jit_compile_us = jit_compile_time;
+                    }
+                }
+                Err(err) => {
+                    log::warn!("parrot JIT compilation failed, the program is interpreted: {err}")
+                }
             }
         }
 

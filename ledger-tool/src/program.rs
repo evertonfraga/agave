@@ -321,6 +321,8 @@ fn load_program<'a>(
     .unwrap();
     #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
     verified_executable.jit_compile().unwrap();
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    verified_executable.parrot_compile().unwrap();
     unsafe {
         std::mem::transmute::<
             Executable<InvokeContext<'static, 'static>>,
