@@ -1587,6 +1587,23 @@ impl Blockstore {
         })
     }
 
+    /// Return the available data and coding shreds of `erasure_set` for
+    /// recovery.
+    /// Note: that we do not do recovery on the Alternate shred columns
+    fn get_recovery_shreds<'a>(
+        &'a self,
+        index: &'a Index,
+        erasure_set: ErasureSetId,
+        erasure_meta: Option<&'a ErasureMeta>,
+        prev_inserted_shreds: &'a HashMap<(BlockLocation, ShredId), Shred>,
+    ) -> impl Iterator<Item = Shred> + 'a {
+        let data = self.get_recovery_data_shreds(index, erasure_set, prev_inserted_shreds);
+        let code = erasure_meta.into_iter().flat_map(|erasure_meta| {
+            self.get_recovery_coding_shreds(index, erasure_meta, prev_inserted_shreds)
+        });
+        data.chain(code)
+    }
+
     /// Rebuilds the whole erasure batch of `erasure_set` from the shreds
     /// available in blockstore, applying filters to them.
     /// Note: that we do not do recovery on the Alternate shred columns
@@ -1598,11 +1615,9 @@ impl Blockstore {
         prev_inserted_shreds: &HashMap<(BlockLocation, ShredId), Shred>,
         shred_recovery_ctx: &mut ShredRecoveryContext,
     ) -> std::result::Result<ErasureBatch, shred::Error> {
-        let data = self.get_recovery_data_shreds(index, erasure_set, prev_inserted_shreds);
-        let code = erasure_meta.into_iter().flat_map(|erasure_meta| {
-            self.get_recovery_coding_shreds(index, erasure_meta, prev_inserted_shreds)
-        });
-        shred_recovery_ctx.rebuild_erasure_batch(data.chain(code))
+        let shreds =
+            self.get_recovery_shreds(index, erasure_set, erasure_meta, prev_inserted_shreds);
+        shred_recovery_ctx.rebuild_erasure_batch(shreds)
     }
 
     /// Collects and reports [`BlockstoreRocksDbColumnFamilyMetrics`] for the
@@ -1898,15 +1913,40 @@ impl Blockstore {
         let mut recovered_data_shreds =
             Vec::with_capacity(num_to_recover * DATA_SHREDS_PER_FEC_BLOCK);
         let mut slots_failing_checks = HashSet::new();
+        // With a thread pool, the shreds are read and filtered here, and the
+        // erasure batches are rebuilt in parallel. The loop below then handles
+        // the results in order. Otherwise, the loop rebuilds each erasure batch.
+        let mut rebuilt_batches = None;
+        if erasure_sets_to_rebuild.len() > 1 && shred_recovery_ctx.has_thread_pool() {
+            let shreds =
+                erasure_sets_to_rebuild
+                    .iter()
+                    .map(|&(erasure_set, erasure_meta, index, _)| {
+                        self.get_recovery_shreds(
+                            index,
+                            erasure_set,
+                            erasure_meta,
+                            prev_inserted_shreds,
+                        )
+                    });
+            let batches = shred_recovery_ctx.rebuild_erasure_batches(shreds);
+            rebuilt_batches = Some(batches.into_iter());
+        }
         for (erasure_set, erasure_meta, index, actions) in erasure_sets_to_rebuild {
             let should_check = actions.run_fec_checks;
-            let batch = match self.rebuild_erasure_batch(
-                index,
-                erasure_set,
-                erasure_meta,
-                prev_inserted_shreds,
-                shred_recovery_ctx,
-            ) {
+            let batch = match &mut rebuilt_batches {
+                Some(batches) => batches
+                    .next()
+                    .expect("one rebuilt erasure batch per erasure set"),
+                None => self.rebuild_erasure_batch(
+                    index,
+                    erasure_set,
+                    erasure_meta,
+                    prev_inserted_shreds,
+                    shred_recovery_ctx,
+                ),
+            };
+            let batch = match batch {
                 Ok(batch) => batch,
                 Err(err) => {
                     debug!(

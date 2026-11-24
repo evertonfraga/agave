@@ -314,15 +314,17 @@ impl WindowService {
         Builder::new()
             .name("solWinInsert".to_string())
             .spawn(move || {
-                let thread_pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(get_thread_count().min(8))
-                    // Use the current thread as one of the workers. This reduces overhead when the
-                    // pool is used to process a small number of shreds, since they'll be processed
-                    // directly on the current thread.
-                    .use_current_thread()
-                    .thread_name(|i| format!("solWinInsert{i:02}"))
-                    .build()
-                    .unwrap();
+                let thread_pool = Arc::new(
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(get_thread_count().min(8))
+                        // Use the current thread as one of the workers. This reduces overhead when
+                        // the pool is used to process a small number of shreds, since they'll be
+                        // processed directly on the current thread.
+                        .use_current_thread()
+                        .thread_name(|i| format!("solWinInsert{i:02}"))
+                        .build()
+                        .unwrap(),
+                );
                 let handle_duplicate = |possible_duplicate_shred| {
                     let _ = check_duplicate_sender.send(possible_duplicate_shred);
                 };
@@ -335,7 +337,8 @@ impl WindowService {
                     retransmit_sender,
                     sharable_banks.root(),
                     shred_version,
-                );
+                )
+                .with_thread_pool(thread_pool.clone());
                 let mut pinnable_slice = blockstore.new_pinnable_slice();
                 let mut write_batch = blockstore.get_write_batch();
 
