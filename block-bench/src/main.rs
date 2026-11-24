@@ -11,7 +11,8 @@
 //! - B, window pass: `Shred::new_from_serialized_shred` and `merkle_root` on
 //!   a rayon pool, as the window service does;
 //! - C, blockstore insert: `insert_shreds_at_location_handle_duplicate` with
-//!   erasure recovery, which also builds the double-Merkle block id;
+//!   erasure recovery on the window pool, which also builds the double-Merkle
+//!   block id;
 //! - D, replay: from `Bank::new_from_parent` to `insert_bank_hash`, using the
 //!   same calls as `process_single_slot`.
 //!
@@ -2001,12 +2002,14 @@ fn run_measured(
         },
     )
     .unwrap();
-    let window_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(config.window_threads)
-        .use_current_thread()
-        .thread_name(|i| format!("bbWindow{i:02}"))
-        .build()
-        .unwrap();
+    let window_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(config.window_threads)
+            .use_current_thread()
+            .thread_name(|i| format!("bbWindow{i:02}"))
+            .build()
+            .unwrap(),
+    );
     // Recovered shreds go to retransmit in production; here they are dropped.
     let retransmit_sender: RetransmitSender = Arc::new(
         WorkerPool::spawn(
@@ -2016,8 +2019,12 @@ fn run_measured(
         .unwrap(),
     );
     let blockstore = &chain.blockstore;
+    // Erasure batches of an insert call are rebuilt on the window pool, and
+    // the coding shards of each erasure batch are encoded on it, as the window
+    // service does with its insert pool.
     let mut recovery_context =
-        ShredRecoveryContext::new(retransmit_sender, chain.bank(0), shred_version);
+        ShredRecoveryContext::new(retransmit_sender, chain.bank(0), shred_version)
+            .with_thread_pool(window_pool.clone());
     let mut pinnable_slice = blockstore.new_pinnable_slice();
     let mut write_batch = blockstore.get_write_batch();
     let num_duplicate_shreds = Cell::new(0usize);
