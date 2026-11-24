@@ -109,16 +109,38 @@ impl PubkeyAffine {
             return false;
         }
 
-        // Check e(pubkey, H(m)) = e(g1, signature) without preparing
-        // either G2 point.
         let generator = G1Affine::generator();
-        let message_pairing =
-            blst::blst_fp12::miller_loop(hashed_message.0.as_ref(), self.0.as_ref());
-        let signature_pairing =
-            blst::blst_fp12::miller_loop(signature.0.as_ref(), generator.as_ref());
+        // Unlike blst_miller_loop, blst_miller_loop_n has no special case for
+        // points at infinity, so an identity signature or message keeps the
+        // two separate Miller loops.
+        if bool::from(signature.0.is_identity()) || bool::from(hashed_message.0.is_identity()) {
+            let message_pairing =
+                blst::blst_fp12::miller_loop(hashed_message.0.as_ref(), self.0.as_ref());
+            let signature_pairing =
+                blst::blst_fp12::miller_loop(signature.0.as_ref(), generator.as_ref());
+            return blst::blst_fp12::finalverify(&message_pairing, &signature_pairing);
+        }
 
-        // Compare the pairings using one final exponentiation.
-        blst::blst_fp12::finalverify(&message_pairing, &signature_pairing)
+        // Check e(pubkey, H(m)) * e(-g1, signature) = 1, which is
+        // e(pubkey, H(m)) = e(g1, signature), without preparing either G2
+        // point. One Miller loop over both pairs squares its accumulator once
+        // per step instead of once per pair, and one final exponentiation
+        // follows.
+        let neg_generator = -generator;
+        let q: [*const blst::blst_p2_affine; 2] = [hashed_message.0.as_ref(), signature.0.as_ref()];
+        let p: [*const blst::blst_p1_affine; 2] = [self.0.as_ref(), neg_generator.as_ref()];
+        let mut pairing = blst::blst_fp12::default();
+        // SAFETY: q and p each hold two pointers to valid affine points, none
+        // of them at infinity, which is what blst_miller_loop_n requires for
+        // n = 2. The points and pairing stay valid for the call, blst writes
+        // only to pairing and keeps none of the pointers. Unlike
+        // blst_fp12::miller_loop_n, the raw binding runs on this thread.
+        unsafe {
+            blst::blst_miller_loop_n(&mut pairing, q.as_ptr(), p.as_ptr(), q.len());
+        }
+        let pairing = pairing.final_exp();
+        // SAFETY: pairing is an initialized blst_fp12 that blst only reads.
+        unsafe { blst::blst_fp12_is_one(&pairing) }
     }
 
     pub(crate) fn _verify_signature_prepared(
@@ -161,5 +183,164 @@ impl PubkeyAffine {
 
         // Compare the pairings using one final exponentiation.
         blst::blst_fp12::finalverify(&payload_pairing, &proof_pairing)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{keypair::Keypair, pubkey::PubkeyProjective, signature::SignatureProjective},
+        blstrs::G2Affine,
+        std::vec::Vec,
+    };
+
+    /// The check of `_verify_signature` with one Miller loop per pair, as it
+    /// was before the two pairs shared one Miller loop.
+    fn verify_signature_with_two_miller_loops(
+        pubkey: &PubkeyAffine,
+        signature: &SignatureAffine,
+        hashed_message: &HashedMessage,
+    ) -> bool {
+        if bool::from(pubkey.0.is_identity()) {
+            return false;
+        }
+        let generator = G1Affine::generator();
+        let message_pairing =
+            blst::blst_fp12::miller_loop(hashed_message.0.as_ref(), pubkey.0.as_ref());
+        let signature_pairing =
+            blst::blst_fp12::miller_loop(signature.0.as_ref(), generator.as_ref());
+        blst::blst_fp12::finalverify(&message_pairing, &signature_pairing)
+    }
+
+    /// Checks that `_verify_signature` returns the same result as the check
+    /// with two Miller loops and, for a message that is not the identity, as
+    /// the check with a prepared message. Returns that result.
+    fn check(
+        label: &str,
+        pubkey: &PubkeyAffine,
+        signature: &SignatureAffine,
+        hashed_message: &HashedMessage,
+    ) -> bool {
+        let expected = verify_signature_with_two_miller_loops(pubkey, signature, hashed_message);
+        assert_eq!(
+            pubkey._verify_signature(signature, hashed_message),
+            expected,
+            "{label}",
+        );
+        if !bool::from(hashed_message.0.is_identity()) {
+            let prepared = PreparedG2::from(hashed_message.0);
+            assert_eq!(
+                pubkey._verify_signature_prepared(signature, &prepared),
+                expected,
+                "{label}: prepared",
+            );
+        }
+        expected
+    }
+
+    #[test]
+    fn test_miller_loop_pair_matches_two_miller_loops() {
+        let keypairs = [
+            Keypair::derive(&[60u8; 32]).unwrap(),
+            Keypair::derive(&[61u8; 32]).unwrap(),
+        ];
+        let messages: [&[u8]; 2] = [b"miller loop pair", b""];
+        let hashes = messages.map(HashedMessage::new);
+
+        for (signer_index, signer) in keypairs.iter().enumerate() {
+            for (signed_index, message) in messages.iter().enumerate() {
+                let signature = SignatureAffine::from(signer.sign(message));
+                for (verifier_index, verifier) in keypairs.iter().enumerate() {
+                    for (checked_index, hashed_message) in hashes.iter().enumerate() {
+                        let label = std::format!(
+                            "signer {signer_index}, message {signed_index}, verifier \
+                             {verifier_index}, checked message {checked_index}"
+                        );
+                        assert_eq!(
+                            check(&label, &verifier.public, &signature, hashed_message),
+                            signer_index == verifier_index && signed_index == checked_index,
+                            "{label}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_miller_loop_pair_matches_two_miller_loops_for_aggregates() {
+        let keypairs = [
+            Keypair::derive(&[62u8; 32]).unwrap(),
+            Keypair::derive(&[63u8; 32]).unwrap(),
+            Keypair::derive(&[64u8; 32]).unwrap(),
+        ];
+        let message = b"aggregate";
+        let hashed_message = HashedMessage::new(message);
+        let aggregate_pubkey = PubkeyAffine::from(
+            *PubkeyProjective::aggregate(keypairs.iter().map(|keypair| &keypair.public)).unwrap(),
+        );
+        let signatures: Vec<_> = keypairs
+            .iter()
+            .map(|keypair| keypair.sign(message))
+            .collect();
+        let aggregate_signature =
+            SignatureAffine::from(SignatureProjective::aggregate(signatures.iter()).unwrap());
+        let mut wrong_signatures = signatures.clone();
+        wrong_signatures[1] = keypairs[1].sign(b"another message");
+        let wrong_aggregate_signature =
+            SignatureAffine::from(SignatureProjective::aggregate(wrong_signatures.iter()).unwrap());
+
+        assert!(check(
+            "valid aggregate",
+            &aggregate_pubkey,
+            &aggregate_signature,
+            &hashed_message,
+        ));
+        assert!(!check(
+            "aggregate with a wrong signature",
+            &aggregate_pubkey,
+            &wrong_aggregate_signature,
+            &hashed_message,
+        ));
+    }
+
+    #[test]
+    fn test_miller_loop_pair_identity_inputs() {
+        let keypair = Keypair::derive(&[65u8; 32]).unwrap();
+        let message = b"identity inputs";
+        let hashed_message = HashedMessage::new(message);
+        let identity_hashed_message = HashedMessage(G2Affine::identity());
+        let signature = SignatureAffine::from(keypair.sign(message));
+        let identity_signature = SignatureAffine::from(SignatureProjective::identity());
+        let identity_pubkey = PubkeyAffine::from(PubkeyProjective::identity());
+
+        assert!(!check(
+            "identity signature",
+            &keypair.public,
+            &identity_signature,
+            &hashed_message,
+        ));
+        assert!(!check(
+            "identity public key",
+            &identity_pubkey,
+            &signature,
+            &hashed_message,
+        ));
+        // An identity message cannot come from hashing. Both Miller loops of
+        // the identity message and the identity signature give one, so that
+        // pair passes the check.
+        assert!(!check(
+            "identity message",
+            &keypair.public,
+            &signature,
+            &identity_hashed_message,
+        ));
+        assert!(check(
+            "identity message and identity signature",
+            &keypair.public,
+            &identity_signature,
+            &identity_hashed_message,
+        ));
     }
 }
