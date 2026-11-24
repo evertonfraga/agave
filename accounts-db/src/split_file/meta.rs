@@ -133,6 +133,12 @@ pub const META_ENTRY_INLINE_DATA_MAX_SIZE: usize = META_ENTRY_MAX_SIZE - META_EN
 /// Size, in bytes, of a meta entry's fixed portion (i.e. *not* the data ref).
 pub const META_ENTRY_FIXED_SIZE: usize = 88;
 
+/// Size, in bytes, of the first read of a meta entry.
+///
+/// It holds the fixed portion, and the whole entry of most accounts, such as token and stake
+/// accounts. A longer entry needs a second read for the rest.
+pub const META_ENTRY_FIRST_READ_SIZE: usize = 512;
+
 // byte-offsets of the fields within a meta entry
 const META_ENTRY_OFFSET_OF_ADDRESS: usize = 0;
 const META_ENTRY_OFFSET_OF_OWNER: usize = 32;
@@ -329,9 +335,12 @@ pub fn read_meta_entry<Ret>(
     Ok(callback(meta_entry, data_ref))
 }
 
-/// Reads the meta entry at `offset` into `buffer`, and returns the bytes read: up to
-/// `META_ENTRY_MAX_SIZE`, and not past `file_len`. The entry's size is unknown until its fixed
-/// portion is parsed.
+/// Reads the meta entry at `offset` into `buffer`, and returns the bytes read, which hold the
+/// whole entry unless `file_len` truncates it.
+///
+/// The entry's size is unknown until its fixed portion is parsed, so the first read is
+/// `META_ENTRY_FIRST_READ_SIZE` bytes, and only a longer entry is read again for the rest. If the
+/// fixed portion is invalid, only the first read is returned, and parsing it gives the error.
 pub fn read_meta_entry_bytes<'a>(
     file: &File,
     file_len: FileSize,
@@ -340,10 +349,30 @@ pub fn read_meta_entry_bytes<'a>(
 ) -> Result<&'a [u8], ReadMetaEntryError> {
     validate_meta_entry_offset(file_len, offset)?;
 
-    let read_size = cmp::min(META_ENTRY_MAX_SIZE, (file_len - offset.0) as usize);
-    // SAFETY: `read_into_buffer` will only write to uninitialized memory.
-    let buffer_bytes = unsafe { buffer.bytes_mut(read_size) };
-    let num_bytes_read = file_io::read_into_buffer(file, file_len, offset.0, buffer_bytes)?;
+    let max_read_size = cmp::min(META_ENTRY_MAX_SIZE, (file_len - offset.0) as usize);
+    // SAFETY: Only `read_into_buffer` writes to these bytes, and only the bytes it has read are
+    // parsed and returned.
+    let buffer_bytes = unsafe { buffer.bytes_mut(max_read_size) };
+    let first_read_size = cmp::min(META_ENTRY_FIRST_READ_SIZE, max_read_size);
+    let mut num_bytes_read = file_io::read_into_buffer(
+        file,
+        file_len,
+        offset.0,
+        &mut buffer_bytes[..first_read_size],
+    )?;
+    let stored_size = parse_meta_entry_fixed(&buffer_bytes[..num_bytes_read])
+        .map(|meta_entry| calculate_meta_entry_stored_size(meta_entry.data_len));
+    if let Ok(stored_size) = stored_size {
+        let read_size = cmp::min(stored_size, max_read_size);
+        if read_size > num_bytes_read {
+            num_bytes_read += file_io::read_into_buffer(
+                file,
+                file_len,
+                offset.0 + num_bytes_read as FileSize,
+                &mut buffer_bytes[num_bytes_read..read_size],
+            )?;
+        }
+    }
     Ok(&buffer_bytes[..num_bytes_read])
 }
 
@@ -546,6 +575,9 @@ pub struct MetaEntryRef<'a> {
 const _: () = const {
     assert!(align_of::<MetaEntryBuffer>() >= align_of::<MetaEntrySerde>());
     assert!(META_ENTRY_BUFFER_SIZE >= META_ENTRY_MAX_SIZE);
+    // the first read of a meta entry must hold its fixed portion, which gives the entry's size
+    assert!(META_ENTRY_FIRST_READ_SIZE >= META_ENTRY_FIXED_SIZE);
+    assert!(META_ENTRY_FIRST_READ_SIZE <= META_ENTRY_MAX_SIZE);
 };
 
 #[cfg(test)]
@@ -827,6 +859,92 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    /// Ensure a meta entry is read whole when it is shorter than, as long as, or longer than the
+    /// first read, whether more bytes follow it or not, and that a truncated entry is read up to
+    /// the end of the file.
+    #[test_case(META_ENTRY_FIRST_READ_SIZE - META_ENTRY_FIXED_SIZE - 1; "under_first_read")]
+    #[test_case(META_ENTRY_FIRST_READ_SIZE - META_ENTRY_FIXED_SIZE; "at_first_read")]
+    #[test_case(META_ENTRY_FIRST_READ_SIZE - META_ENTRY_FIXED_SIZE + 1; "over_first_read")]
+    #[test_case(META_ENTRY_INLINE_DATA_MAX_SIZE; "max_inline")]
+    fn test_read_meta_entry_first_read_boundary(data_len: usize) {
+        let mut file = tempfile::tempfile().unwrap();
+        let offset = FileOffset(META_HEADER_SIZE as FileSize);
+        file.seek(SeekFrom::Start(offset.0)).unwrap();
+        let address = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let lamports = 1_000_000;
+        let rent_epoch = u64::MAX;
+        let data: Vec<_> = (0..data_len).map(|i| i as u8).collect();
+        let write_info = write_meta_entry(
+            &mut file,
+            offset,
+            &address,
+            &owner,
+            lamports,
+            rent_epoch,
+            true,
+            DataLen::try_from(data_len).unwrap(),
+            DataRef::Inline(&data),
+        )
+        .unwrap();
+        let stored_size = write_info.num_bytes_written;
+        assert_eq!(stored_size, META_ENTRY_FIXED_SIZE + data_len);
+        // bytes after the entry, as the next entries would be
+        file.write_all(&[0xFF; META_ENTRY_MAX_SIZE]).unwrap();
+        let end = offset.0 + stored_size as FileSize;
+
+        for file_len in [end, end + META_ENTRY_MAX_SIZE as FileSize] {
+            read_meta_entry(&file, file_len, offset, |read_meta_entry, read_data_ref| {
+                assert_eq!(read_meta_entry.address, &address);
+                assert_eq!(read_meta_entry.owner, &owner);
+                assert_eq!(read_meta_entry.lamports, lamports);
+                assert_eq!(read_meta_entry.rent_epoch, rent_epoch);
+                assert!(read_meta_entry.is_executable);
+                assert_eq!(read_meta_entry.data_len.0 as usize, data_len);
+                assert_eq!(read_data_ref, DataRef::Inline(&data));
+            })
+            .unwrap();
+        }
+
+        for truncated_size in META_ENTRY_FIXED_SIZE..stored_size {
+            let file_len = offset.0 + truncated_size as FileSize;
+            let err = read_meta_entry(&file, file_len, offset, |_, _| ()).unwrap_err();
+            assert_matches!(
+                err,
+                ReadMetaEntryError::ShortRead { expected, actual }
+                    if expected == stored_size && actual == truncated_size
+            );
+        }
+    }
+
+    /// Ensure a meta entry with an invalid fixed portion gives the error of its fixed portion,
+    /// even if its data_len is longer than the first read.
+    #[test]
+    fn test_read_meta_entry_invalid_fixed_portion() {
+        let file = tempfile::tempfile().unwrap();
+        let offset = FileOffset(META_HEADER_SIZE as FileSize);
+        let file_len = offset.0 + META_ENTRY_MAX_SIZE as FileSize;
+        file.set_len(file_len).unwrap();
+        let mut meta_entry = MetaEntrySerde {
+            address: Pubkey::new_unique(),
+            owner: Pubkey::new_unique(),
+            lamports: 123,
+            rent_epoch: 456,
+            is_executable: 7,
+            _unused: [0; 3],
+            data_len: META_ENTRY_INLINE_DATA_MAX_SIZE as u32,
+        };
+        file_io::write_buffer_to_file(&file, as_bytes_ref(&meta_entry), offset.0).unwrap();
+        let err = read_meta_entry(&file, file_len, offset, |_, _| ()).unwrap_err();
+        assert_matches!(err, ReadMetaEntryError::InvalidIsExecutable(7));
+
+        meta_entry.is_executable = 0;
+        meta_entry.data_len = DataLen::MAX + 1;
+        file_io::write_buffer_to_file(&file, as_bytes_ref(&meta_entry), offset.0).unwrap();
+        let err = read_meta_entry(&file, file_len, offset, |_, _| ()).unwrap_err();
+        assert_matches!(err, ReadMetaEntryError::InvalidDataLen(_));
     }
 
     #[test]
