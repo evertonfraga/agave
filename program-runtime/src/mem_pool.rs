@@ -103,15 +103,35 @@ pub struct VmMemoryPool {
     call_frame: Pool<CallFrameBuffer, MAX_INSTRUCTION_STACK_DEPTH_SIMD_0268>,
 }
 
+/// Measurement only. A zero-filled allocation starts with pages that the
+/// process has not written yet, and reads from such a page go to the kernel's
+/// shared zero page. In a long-running validator, programs with deep call
+/// stacks or large heaps write to the pages of the pooled buffers sooner or
+/// later. Write a nonzero byte every 4 KiB and then clear the buffer, so that
+/// every page has its own memory from the start.
+fn write_every_page(mut memory: AlignedMemory<{ HOST_ALIGN }>) -> AlignedMemory<{ HOST_ALIGN }> {
+    let bytes = memory.as_slice_mut();
+    for byte in bytes.iter_mut().step_by(4096) {
+        *byte = 1;
+    }
+    // The allocation is known to be zero, so keep the compiler from removing
+    // the writes above and the clear below.
+    let bytes = std::hint::black_box(bytes);
+    bytes.fill(0);
+    memory
+}
+
 impl VmMemoryPool {
     pub fn new() -> Self {
         Self {
             stack: Pool::new(array::from_fn(|_| {
                 #[allow(clippy::arithmetic_side_effects)]
-                AlignedMemory::zero_filled(solana_sbpf::vm::get_stack_frame_size() * MAX_CALL_DEPTH)
+                write_every_page(AlignedMemory::zero_filled(
+                    solana_sbpf::vm::get_stack_frame_size() * MAX_CALL_DEPTH,
+                ))
             })),
             heap: Pool::new(array::from_fn(|_| {
-                AlignedMemory::zero_filled(MAX_HEAP_FRAME_BYTES as usize)
+                write_every_page(AlignedMemory::zero_filled(MAX_HEAP_FRAME_BYTES as usize))
             })),
             call_frame: Pool::new(array::from_fn(|_| CallFrameBuffer::default())),
         }
