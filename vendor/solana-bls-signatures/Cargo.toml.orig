@@ -1,0 +1,78 @@
+[package]
+name = "solana-bls-signatures"
+description = "Solana BLS Signatures"
+documentation = "https://docs.rs/solana-bls-signatures"
+version = "4.0.2"
+rust-version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+rustdoc-args = ["--cfg=docsrs"]
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+bytemuck = ["dep:bytemuck"]
+default = ["std"]
+frozen-abi = ["dep:solana-frozen-abi", "dep:solana-frozen-abi-macro", "std"]
+parallel = ["dep:rayon"]
+serde = ["dep:cfg_eval", "dep:serde", "dep:serde_with"]
+solana-signer-derive = ["dep:solana-signer", "dep:solana-signature", "dep:subtle"]
+std = ["dep:serde_json", "wincode?/std"]
+wincode = ["dep:wincode"]
+
+[dependencies]
+base64 = { workspace = true }
+bytemuck = { workspace = true, optional = true }
+cfg_eval = { workspace = true, optional = true }
+pairing = { workspace = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+serde_json = { workspace = true, optional = true }
+serde_with = { workspace = true, features = ["macros"], optional = true }
+solana-frozen-abi = { workspace = true, optional = true, features = ["frozen-abi"] }
+solana-frozen-abi-macro = { workspace = true, optional = true, features = ["frozen-abi"] }
+thiserror = { workspace = true }
+wincode = { workspace = true, optional = true }
+zeroize = { workspace = true, features = ["zeroize_derive"] }
+
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+blst = { workspace = true }
+blstrs = { workspace = true }
+ff = { workspace = true }
+group = { workspace = true }
+rand = "0.8"  # blstrs is still on rand_core v0.6, so pin this for now
+rayon = { workspace = true, optional = true }
+solana-signature = { workspace = true, optional = true }
+solana-signer = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
+criterion = { workspace = true }
+hex = { workspace = true }
+solana-bls-signatures = { path = ".", features = ["std"] }
+solana-keypair = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "allocation_regression"
+path = "tests/allocation_regression.rs"
+harness = false
+
+[[bench]]
+name = "bls_signatures"
+harness = false
+
+[[bench]]
+name = "verification_paths"
+harness = false
