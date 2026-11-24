@@ -51,7 +51,6 @@ solana-runtime = { workspace = true }
 solana-signer-store = { workspace = true }
 solana-streamer = { workspace = true }
 thiserror = { workspace = true }
-wincode = { workspace = true }
 
 [dev-dependencies]
 agave-bls-sigverify = { path = ".", features = ["agave-unstable-api", "dev-context-only-utils"] }
@@ -66,6 +65,7 @@ solana-net-utils = { path = "../net-utils", features = ["agave-unstable-api"] }
 solana-perf = { path = "../perf", features = ["agave-unstable-api"] }
 solana-signer = { workspace = true }
 tokio = { workspace = true }
+wincode = { workspace = true }
 
 [[bench]]
 name = "bls_vote_sigverify"

@@ -3,6 +3,7 @@ use {
         bls_sigverifier::SigVerifierChannels,
         bls_vote_sigverify::batch::Batch,
         errors::SigVerifyVoteError,
+        prepared_msg_cache::PreparedMsgCache,
         stats::{SigVerifyVoteStats, VoteSenderStats, VoteVerificationStats},
     },
     agave_votor_messages::wire::VotePayloadToSign,
@@ -24,6 +25,9 @@ pub(crate) mod batch;
 /// to rewards container and repair.
 ///
 /// Any vote that fails fallback individual signature verification will have its sender banlisted.
+///
+/// The prepared messages of payloads with at least one valid vote are inserted into
+/// `prepared_msg_cache`.
 pub(super) fn verify_and_send_votes(
     unverified_votes: &mut HashMap<VotePayloadToSign, Batch>,
     root_bank: &Bank,
@@ -32,6 +36,7 @@ pub(super) fn verify_and_send_votes(
     ban_sender: &BanSender,
     thread_pool: &ThreadPool,
     channels: &SigVerifierChannels,
+    prepared_msg_cache: &mut PreparedMsgCache,
 ) -> Result<SigVerifyVoteStats, SigVerifyVoteError> {
     let mut measure = Measure::start("verify_and_send_votes");
     let mut stats = SigVerifyVoteStats::default();
@@ -67,7 +72,10 @@ pub(super) fn verify_and_send_votes(
     stats.votes_to_sig_verify += votes_to_verify;
     stats.vote_verification_stats.merge(vote_verification_stats);
     let mut sender_stats = VoteSenderStats::default();
-    for (_, batch) in unverified_votes.drain() {
+    for (vote_payload_to_sign, mut batch) in unverified_votes.drain() {
+        if let Some(prepared_msg) = batch.take_prepared_msg() {
+            prepared_msg_cache.insert(vote_payload_to_sign, prepared_msg);
+        }
         batch.process(
             root_bank,
             leader_schedule,
