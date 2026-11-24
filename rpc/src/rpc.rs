@@ -146,6 +146,9 @@ type RpcCustomResult<T> = std::result::Result<T, RpcCustomError>;
 
 pub const MAX_REQUEST_BODY_SIZE: usize = 50 * (1 << 10); // 50kB
 pub const PERFORMANCE_SAMPLES_LIMIT: usize = 720;
+/// getAccountInfo encodes an account on the worker thread that loaded it, rather than in a
+/// blocking task, if it encodes at most this many bytes of account data.
+const MAX_ACCOUNT_DATA_BYTES_TO_ENCODE_ON_WORKER: usize = 4 * 1024;
 pub(crate) const RANK_MAP_CACHE_CAPACITY: NonZeroUsize =
     NonZeroUsize::new(MAX_LEADER_SCHEDULE_STAKES as usize).unwrap();
 
@@ -591,15 +594,26 @@ impl JsonRpcRequestProcessor {
         })?;
         let encoding = encoding.unwrap_or(UiAccountEncoding::Binary);
 
-        let response = self
-            .runtime
-            .spawn_blocking({
-                let bank = Arc::clone(&bank);
-                move || get_encoded_account(&bank, &pubkey, encoding, data_slice, None)
-            })
-            .await
-            .expect("rpc: get_encoded_account panicked")?;
-        Ok(new_response(&bank, response))
+        // Load the account on this worker thread, as getBalance does, and encode it here too
+        // if that is cheap. A request for a small account then does not wait for a blocking
+        // thread, which may be busy with a long request such as getProgramAccounts.
+        let Some(account) = bank.get_account(&pubkey) else {
+            return Ok(new_response(&bank, None));
+        };
+        let response = if should_encode_on_worker(&account, encoding, data_slice) {
+            encode_loaded_account(&bank, &pubkey, account, encoding, data_slice, None)?
+        } else {
+            self.runtime
+                .spawn_blocking({
+                    let bank = Arc::clone(&bank);
+                    move || {
+                        encode_loaded_account(&bank, &pubkey, account, encoding, data_slice, None)
+                    }
+                })
+                .await
+                .expect("rpc: encode_loaded_account panicked")?
+        };
+        Ok(new_response(&bank, Some(response)))
     }
 
     pub async fn get_multiple_accounts(
@@ -2843,13 +2857,14 @@ fn get_encoded_account(
 ) -> Result<Option<UiAccount>> {
     match account_resolver::get_account_from_overwrites_or_bank(pubkey, bank, overwrite_accounts) {
         Some(account) => {
-            let response = if is_known_spl_token_id(account.owner())
-                && encoding == UiAccountEncoding::JsonParsed
-            {
-                get_parsed_token_account(bank, pubkey, account, overwrite_accounts)
-            } else {
-                encode_account(&account, pubkey, encoding, data_slice)?
-            };
+            let response = encode_loaded_account(
+                bank,
+                pubkey,
+                account,
+                encoding,
+                data_slice,
+                overwrite_accounts,
+            )?;
             Ok(Some(response))
         }
         None => Ok(None),
@@ -2882,6 +2897,51 @@ fn encode_account<T: ReadableAccount>(
             pubkey, account, encoding, None, data_slice,
         ))
     }
+}
+
+/// Encodes `account`, loaded from `bank` or `overwrite_accounts`, for a response.
+fn encode_loaded_account(
+    bank: &Bank,
+    pubkey: &Pubkey,
+    account: AccountSharedData,
+    encoding: UiAccountEncoding,
+    data_slice: Option<UiDataSliceConfig>,
+    // only used for simulation results
+    overwrite_accounts: Option<&HashMap<Pubkey, AccountSharedData>>,
+) -> Result<UiAccount> {
+    if is_known_spl_token_id(account.owner()) && encoding == UiAccountEncoding::JsonParsed {
+        Ok(get_parsed_token_account(
+            bank,
+            pubkey,
+            account,
+            overwrite_accounts,
+        ))
+    } else {
+        encode_account(&account, pubkey, encoding, data_slice)
+    }
+}
+
+/// Returns whether getAccountInfo encodes `account` on the worker thread that loaded it, rather
+/// than in a blocking task. It does if the encoding is not base64+zstd and reads at most
+/// `MAX_ACCOUNT_DATA_BYTES_TO_ENCODE_ON_WORKER` bytes of account data.
+fn should_encode_on_worker(
+    account: &AccountSharedData,
+    encoding: UiAccountEncoding,
+    data_slice: Option<UiDataSliceConfig>,
+) -> bool {
+    let data_len = account.data().len();
+    let encoded_data_len = match encoding {
+        // zstd compression is expensive even for a small account.
+        UiAccountEncoding::Base64Zstd => return false,
+        // The parsers read the whole account data, whatever the data slice.
+        UiAccountEncoding::JsonParsed => data_len,
+        UiAccountEncoding::Binary | UiAccountEncoding::Base58 | UiAccountEncoding::Base64 => {
+            data_slice.map_or(data_len, |s| {
+                min(s.length, data_len.saturating_sub(s.offset))
+            })
+        }
+    };
+    encoded_data_len <= MAX_ACCOUNT_DATA_BYTES_TO_ENCODE_ON_WORKER
 }
 
 /// Analyze custom filters to determine if the result will be a subset of spl-token accounts by
@@ -6693,6 +6753,203 @@ pub mod tests {
             result["value"]["data"], expected,
             "should use data slice if parsing fails"
         );
+    }
+
+    /// getAccountInfo encodes small accounts on the worker thread and the others in a blocking
+    /// task. Either way, its response must be the one built from `get_encoded_account`, which
+    /// loads and encodes an account in one step, as getAccountInfo did in a blocking task.
+    #[test]
+    fn test_rpc_get_account_info_on_worker_and_in_blocking_task() {
+        let rpc = RpcHandler::start();
+        let bank = rpc.working_bank();
+        let limit = MAX_ACCOUNT_DATA_BYTES_TO_ENCODE_ON_WORKER;
+
+        let missing = Pubkey::new_unique();
+        let mut pubkeys = vec![missing];
+        // With jsonParsed, accounts of the system program are parsed as nonce accounts and
+        // accounts of the token program are parsed with their mint. Accounts of other
+        // programs, and accounts that fail to parse, fall back to base64.
+        let other_program = Pubkey::new_unique();
+        for owner in [
+            system_program::id(),
+            other_program,
+            spl_token_interface::id(),
+        ] {
+            for data_len in [
+                0,
+                1,
+                MAX_BASE58_BYTES,
+                MAX_BASE58_BYTES + 1,
+                limit - 1,
+                limit,
+                limit + 1,
+                16 * limit + 1,
+            ] {
+                let pubkey = Pubkey::new_unique();
+                let data = (0..data_len).map(|i| (i % 251) as u8).collect();
+                let account = AccountSharedData::new_with_data(42, data, &owner);
+                bank.store_account(&pubkey, &account);
+                pubkeys.push(pubkey);
+            }
+        }
+
+        // A token account with its mint, and one whose mint is missing.
+        let mint = Pubkey::new_unique();
+        let mut mint_data = vec![0; Mint::get_packed_len()];
+        let mint_state = Mint {
+            mint_authority: COption::None,
+            supply: 1_000,
+            decimals: 2,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+        Mint::pack(mint_state, &mut mint_data).unwrap();
+        let mint_account =
+            AccountSharedData::new_with_data(42, mint_data, &spl_token_interface::id());
+        bank.store_account(&mint, &mint_account);
+        let token_account = Pubkey::new_unique();
+        for (pubkey, mint) in [(token_account, mint), (Pubkey::new_unique(), missing)] {
+            let mut account_data = vec![0; TokenAccount::get_packed_len()];
+            let account_state = TokenAccount {
+                mint,
+                owner: Pubkey::new_unique(),
+                amount: 10,
+                delegate: COption::None,
+                state: TokenAccountState::Initialized,
+                is_native: COption::None,
+                delegated_amount: 0,
+                close_authority: COption::None,
+            };
+            TokenAccount::pack(account_state, &mut account_data).unwrap();
+            let account =
+                AccountSharedData::new_with_data(42, account_data, &spl_token_interface::id());
+            bank.store_account(&pubkey, &account);
+            pubkeys.push(pubkey);
+        }
+        pubkeys.push(mint);
+        let parsed = get_encoded_account(
+            &bank,
+            &token_account,
+            UiAccountEncoding::JsonParsed,
+            None,
+            None,
+        );
+        assert!(matches!(
+            parsed,
+            Ok(Some(UiAccount {
+                data: solana_account_decoder::UiAccountData::Json(_),
+                ..
+            }))
+        ));
+
+        let encodings = [
+            None,
+            Some(UiAccountEncoding::Binary),
+            Some(UiAccountEncoding::Base58),
+            Some(UiAccountEncoding::Base64),
+            Some(UiAccountEncoding::Base64Zstd),
+            Some(UiAccountEncoding::JsonParsed),
+        ];
+        let data_slices = [
+            None,
+            Some((0, 0)),
+            Some((1, 2)),
+            Some((0, limit)),
+            Some((1, limit)),
+            Some((0, limit + 1)),
+            Some((limit, usize::MAX)),
+            Some((usize::MAX, 1)),
+        ]
+        .map(|data_slice| data_slice.map(|(offset, length)| UiDataSliceConfig { offset, length }));
+        let mut encoded_on_worker = HashSet::new();
+        for pubkey in &pubkeys {
+            for encoding in encodings {
+                for data_slice in data_slices {
+                    let request = create_test_request(
+                        "getAccountInfo",
+                        Some(json!([
+                            pubkey.to_string(),
+                            {"encoding": encoding, "dataSlice": data_slice},
+                        ])),
+                    );
+                    let response = rpc
+                        .io
+                        .handle_request_sync(&request.to_string(), rpc.meta.clone())
+                        .expect("no response");
+
+                    let encoding = encoding.unwrap_or(UiAccountEncoding::Binary);
+                    let expected = get_encoded_account(&bank, pubkey, encoding, data_slice, None)
+                        .map(|value| serde_json::to_value(new_response(&bank, value)).unwrap());
+                    let expected = Response::Single(Output::from(
+                        expected,
+                        jsonrpc_core::Id::Num(1),
+                        Some(jsonrpc_core::Version::V2),
+                    ));
+                    assert_eq!(
+                        response,
+                        serde_json::to_string(&expected).unwrap(),
+                        "{pubkey} {encoding:?} {data_slice:?}"
+                    );
+                    if let Some(account) = bank.get_account(pubkey) {
+                        let on_worker = should_encode_on_worker(&account, encoding, data_slice);
+                        encoded_on_worker.insert((encoding, on_worker));
+                    }
+                }
+            }
+        }
+        // Every encoding but base64+zstd was tested on both paths.
+        for encoding in encodings.into_iter().flatten() {
+            assert!(
+                encoded_on_worker.contains(&(encoding, false)),
+                "{encoding:?}"
+            );
+            assert_eq!(
+                encoded_on_worker.contains(&(encoding, true)),
+                encoding != UiAccountEncoding::Base64Zstd,
+                "{encoding:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_encode_on_worker() {
+        let limit = MAX_ACCOUNT_DATA_BYTES_TO_ENCODE_ON_WORKER;
+        let on_worker = |data_len, encoding, data_slice: Option<(usize, usize)>| {
+            let account =
+                AccountSharedData::new_with_data(42, vec![0; data_len], &Pubkey::default());
+            let data_slice =
+                data_slice.map(|(offset, length)| UiDataSliceConfig { offset, length });
+            should_encode_on_worker(&account, encoding, data_slice)
+        };
+
+        for encoding in [
+            UiAccountEncoding::Binary,
+            UiAccountEncoding::Base58,
+            UiAccountEncoding::Base64,
+        ] {
+            assert!(on_worker(0, encoding, None));
+            assert!(on_worker(limit, encoding, None));
+            assert!(!on_worker(limit + 1, encoding, None));
+            // Only the data in the slice counts.
+            assert!(on_worker(2 * limit, encoding, Some((0, limit))));
+            assert!(on_worker(2 * limit, encoding, Some((limit, limit))));
+            assert!(on_worker(2 * limit, encoding, Some((limit, usize::MAX))));
+            assert!(on_worker(2 * limit, encoding, Some((usize::MAX, 1))));
+            assert!(on_worker(limit + 1, encoding, Some((1, usize::MAX))));
+            assert!(!on_worker(2 * limit, encoding, Some((0, limit + 1))));
+            assert!(!on_worker(limit + 1, encoding, Some((0, usize::MAX))));
+        }
+
+        // The parsers read the whole account data, whatever the data slice.
+        let encoding = UiAccountEncoding::JsonParsed;
+        assert!(on_worker(0, encoding, None));
+        assert!(on_worker(limit, encoding, None));
+        assert!(!on_worker(limit + 1, encoding, None));
+        assert!(!on_worker(limit + 1, encoding, Some((0, 1))));
+
+        let encoding = UiAccountEncoding::Base64Zstd;
+        assert!(!on_worker(0, encoding, None));
+        assert!(!on_worker(limit, encoding, Some((0, 1))));
     }
 
     #[test]
