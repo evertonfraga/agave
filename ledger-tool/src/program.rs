@@ -321,6 +321,8 @@ fn load_program<'a>(
     .unwrap();
     #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
     verified_executable.jit_compile().unwrap();
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    verified_executable.parrot_compile().unwrap();
     unsafe {
         std::mem::transmute::<
             Executable<InvokeContext<'static, 'static>>,
@@ -574,7 +576,9 @@ pub fn program(ledger_path: &Path, matches: &ArgMatches<'_>) {
     };
     let mut call_frames = match execution_mode {
         ExecutionMode::Jit => vec![],
-        ExecutionMode::Interpreted | ExecutionMode::PreferJit => {
+        ExecutionMode::Interpreted
+        | ExecutionMode::PreferJit
+        | ExecutionMode::ParrotInterpreted => {
             vec![CallFrame::default(); verified_executable.get_config().max_call_depth]
         }
     };

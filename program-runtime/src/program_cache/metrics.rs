@@ -290,9 +290,15 @@ impl<FG: ForkGraph> crate::program_cache::global::ProgramCache<FG> {
                 ProgramCacheEntryType::DelayVisibility => "DelayVisibility",
                 ProgramCacheEntryType::Unloaded(_) => "Unloaded",
                 ProgramCacheEntryType::Builtin(_) => "Builtin",
-                #[cfg(not(all(not(target_os = "windows"), target_arch = "x86_64")))]
+                #[cfg(not(any(
+                    all(not(target_os = "windows"), target_arch = "x86_64"),
+                    all(target_os = "linux", target_arch = "aarch64")
+                )))]
                 ProgramCacheEntryType::Loaded(_) => "Loaded",
-                #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
+                #[cfg(any(
+                    all(not(target_os = "windows"), target_arch = "x86_64"),
+                    all(target_os = "linux", target_arch = "aarch64")
+                ))]
                 ProgramCacheEntryType::Loaded(executable) => {
                     if executable.get_compiled_program().is_some() {
                         "JitCompiled"
