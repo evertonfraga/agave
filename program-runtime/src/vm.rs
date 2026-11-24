@@ -369,6 +369,10 @@ pub fn execute<'a, 'b: 'a>(
             ExecutionMode::Interpreted => cache_entry.stats.interpreter_executed(this_call_us),
             ExecutionMode::Jit => cache_entry.stats.jit_executed(this_call_us),
             ExecutionMode::PreferJit => { /* not actually executed? */ }
+            // Not requested here: `PreferJit` resolves to `Jit` or `Interpreted`.
+            ExecutionMode::ParrotInterpreted => {
+                cache_entry.stats.interpreter_executed(this_call_us)
+            }
         }
 
         ic_logger_msg!(

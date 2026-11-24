@@ -135,6 +135,7 @@ exclude = [
     "dev-bins",
     "programs/sbf",
     "svm/tests/example-programs",
+    "vendor/solana-sbpf",
 ]
 
 resolver = "2"
@@ -631,6 +632,11 @@ lto = "fat"
 codegen-units = 1
 
 [patch.crates-io]
+# solana-sbpf 0.28.0 plus the parrot JIT with its aarch64 backend, vendored so that agave runs sBPF
+# programs JIT-compiled on aarch64 Linux. The library code (src/) is anza-xyz/sbpf PR #314 at
+# 158b87669078a867f959ccf7c75fcb73fe0adf87 (v0.28.0 + #262 + the parrot stack #264, #311, #312,
+# #313, #305, #314), unchanged; one more commit (654f8ba) only adds tests and fuzzer checks.
+solana-sbpf = { path = "vendor/solana-sbpf" }
 blstrs = { git = "https://github.com/anza-xyz/blstrs", rev = "a1faffa3420bdaf4102425c43f00cdd815d4f145" }
 # for details, see https://github.com/anza-xyz/crossbeam/commit/5ee1c6ec671d94db14ed9238eb99e59a84555aad
 crossbeam-epoch = { git = "https://github.com/anza-xyz/crossbeam", rev = "5ee1c6ec671d94db14ed9238eb99e59a84555aad" }
