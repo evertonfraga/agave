@@ -105,7 +105,6 @@ dependencies = [
  "solana-signer-store",
  "solana-streamer",
  "thiserror 2.0.21",
- "wincode",
 ]
 
 [[package]]

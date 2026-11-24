@@ -9,6 +9,7 @@ use {
     agave_votor_messages::wire::VotePayloadToSign,
     agave_votor_transport::endpoint::BanSender,
     rayon::ThreadPool,
+    solana_bls_signatures::PreparedHashedMessage,
     solana_ledger::leader_schedule_cache::LeaderScheduleCache,
     solana_pubkey::Pubkey,
     solana_runtime::{bank::Bank, epoch_stakes::BLSPubkeyToRankMap},
@@ -18,6 +19,9 @@ use {
 pub(crate) struct Batch {
     batch_state: BatchState,
     rank_map: Arc<BLSPubkeyToRankMap>,
+    /// The prepared message of the payload. Before verification, this is the one the sigverifier
+    /// has cached, if any. After verification, it is set if at least one vote was valid.
+    prepared_msg: Option<Arc<PreparedHashedMessage>>,
 }
 
 impl Batch {
@@ -26,6 +30,7 @@ impl Batch {
         payload: UnverifiedVotePayload,
         sender_vote_account_pubkey: Pubkey,
         rank_map: Arc<BLSPubkeyToRankMap>,
+        cached_prepared_msg: Option<Arc<PreparedHashedMessage>>,
     ) -> Self {
         let unverified_batch =
             UnverifiedBatch::new(vote_payload_to_sign, payload, sender_vote_account_pubkey);
@@ -33,6 +38,7 @@ impl Batch {
         Self {
             batch_state,
             rank_map,
+            prepared_msg: cached_prepared_msg,
         }
     }
 
@@ -54,8 +60,20 @@ impl Batch {
         ban_sender: &BanSender,
         thread_pool: &ThreadPool,
     ) -> (usize, VoteVerificationStats) {
-        self.batch_state
-            .verify(self.rank_map.len(), ban_sender, thread_pool)
+        let (num_votes_to_sigverify, stats, prepared_msg) = self.batch_state.verify(
+            self.rank_map.len(),
+            self.prepared_msg.take(),
+            ban_sender,
+            thread_pool,
+        );
+        self.prepared_msg = prepared_msg;
+        (num_votes_to_sigverify, stats)
+    }
+
+    /// Takes the prepared message of the payload. After [`Self::verify`], it is set if at least
+    /// one vote was valid.
+    pub(super) fn take_prepared_msg(&mut self) -> Option<Arc<PreparedHashedMessage>> {
+        self.prepared_msg.take()
     }
 
     pub(super) fn process(
@@ -95,16 +113,25 @@ impl BatchState {
     fn verify(
         &mut self,
         max_validators: usize,
+        cached_prepared_msg: Option<Arc<PreparedHashedMessage>>,
         ban_sender: &BanSender,
         thread_pool: &ThreadPool,
-    ) -> (usize, VoteVerificationStats) {
+    ) -> (
+        usize,
+        VoteVerificationStats,
+        Option<Arc<PreparedHashedMessage>>,
+    ) {
         match self {
             Self::Unverified(unverified_batch) => {
                 let num_votes_to_sigverify = unverified_batch.len();
-                let (verified_batch, stats) =
-                    unverified_batch.verify(max_validators, ban_sender, thread_pool);
+                let (verified_batch, stats, prepared_msg) = unverified_batch.verify(
+                    max_validators,
+                    cached_prepared_msg,
+                    ban_sender,
+                    thread_pool,
+                );
                 *self = Self::Verified(verified_batch);
-                (num_votes_to_sigverify, stats)
+                (num_votes_to_sigverify, stats, prepared_msg)
             }
             Self::Verified(_) => unreachable!("Invalid state"),
         }

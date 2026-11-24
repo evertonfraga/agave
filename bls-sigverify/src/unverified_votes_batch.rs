@@ -16,18 +16,18 @@ use {
     rayon::{
         ThreadPool, current_thread_index,
         iter::{
-            Either, IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+            IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
             ParallelIterator,
         },
     },
     solana_bls_signatures::{
-        BlsError, HashedMessage, PreparedHashedMessage, PubkeyProjective, SignatureProjective,
-        VerifySignature,
+        BlsError, PreparedHashedMessage, PubkeyProjective, SignatureProjective, VerifySignature,
         pubkey::{PopVerified, PubkeyAffine},
         signature::SignatureAffine,
     },
     solana_measure::{measure::Measure, measure_us},
     solana_pubkey::Pubkey,
+    std::sync::Arc,
 };
 
 /// A batch of votes to verify.
@@ -66,27 +66,37 @@ impl UnverifiedBatch {
             .push(sender_vote_account_pubkey);
     }
 
+    /// Verifies the votes of the batch.
+    ///
+    /// `cached_prepared_msg` is the prepared message of the payload, if the sigverifier has it.
+    /// Otherwise the payload is hashed and prepared here. Also returns the prepared message if at
+    /// least one vote is valid, so that the sigverifier can cache it.
     pub(crate) fn verify(
         &mut self,
         max_validators: usize,
+        cached_prepared_msg: Option<Arc<PreparedHashedMessage>>,
         ban_sender: &BanSender,
         thread_pool: &ThreadPool,
-    ) -> (Option<VerifiedBatch>, VoteVerificationStats) {
+    ) -> (
+        Option<VerifiedBatch>,
+        VoteVerificationStats,
+        Option<Arc<PreparedHashedMessage>>,
+    ) {
         let mut stats = VoteVerificationStats::default();
 
         // no need to do optimistic verification when batch size == 1.
         if let [unverified_vote] = self.batch.as_slice() {
-            let ((verification_result, sender_identity_pubkey), time_us) = measure_us!({
-                let serialized_vote = wincode::serialize(&self.vote_payload_to_sign).unwrap();
-                let sender_identity_pubkey = unverified_vote.sender_identity_pubkey;
-                (
-                    unverified_vote.verify(
-                        max_validators,
-                        Either::Left((&serialized_vote, thread_pool)),
-                    ),
-                    sender_identity_pubkey,
-                )
-            });
+            let ((verification_result, sender_identity_pubkey, prepared_msg), time_us) =
+                measure_us!({
+                    let prepared_msg = cached_prepared_msg
+                        .unwrap_or_else(|| prepare_msg(&self.vote_payload_to_sign));
+                    let sender_identity_pubkey = unverified_vote.sender_identity_pubkey;
+                    (
+                        unverified_vote.verify(max_validators, &prepared_msg, Some(thread_pool)),
+                        sender_identity_pubkey,
+                        prepared_msg,
+                    )
+                });
             stats.fn_verify_individual_votes_stats.add_sample(time_us);
             return match verification_result {
                 Ok(vote_aggregate) => {
@@ -99,18 +109,20 @@ impl UnverifiedBatch {
                             pubkeys,
                         )),
                         stats,
+                        Some(prepared_msg),
                     )
                 }
                 Err(error) => {
                     ban_invalid_vote_sender(ban_sender, &mut stats, sender_identity_pubkey, error);
-                    (None, stats)
+                    (None, stats, None)
                 }
             };
         }
 
         // Try optimistic verification - fast to verify, but cannot identify invalid votes
-        let res = verify_votes_optimistic(
+        let (res, prepared_msg) = verify_votes_optimistic(
             &self.vote_payload_to_sign,
+            cached_prepared_msg,
             &self.batch,
             &mut stats,
             thread_pool,
@@ -118,7 +130,7 @@ impl UnverifiedBatch {
 
         let sender_vote_account_pubkeys = std::mem::take(&mut self.sender_vote_account_pubkeys);
         match res {
-            Ok(signature) => {
+            Some(signature) => {
                 stats.optimistic_verification_succeeded += 1;
                 stats.optimistic_batch.add_sample(self.batch.len() as u64);
                 let vote_aggregate = VoteAggregate::new_from_verified_votes(
@@ -134,9 +146,10 @@ impl UnverifiedBatch {
                         sender_vote_account_pubkeys,
                     )),
                     stats,
+                    Some(prepared_msg),
                 )
             }
-            Err(hashed_msg) => {
+            None => {
                 // Fallback to individual verification
                 stats.optimistic_verification_failed += 1;
                 let ((verified_batch, invalid_remote_pubkeys), time_us) =
@@ -145,7 +158,7 @@ impl UnverifiedBatch {
                         max_validators,
                         &self.batch,
                         sender_vote_account_pubkeys,
-                        &hashed_msg,
+                        &prepared_msg,
                         thread_pool
                     ));
                 if let Some(b) = &verified_batch {
@@ -155,10 +168,17 @@ impl UnverifiedBatch {
                     ban_invalid_vote_sender(ban_sender, &mut stats, sender_identity_pubkey, error);
                 }
                 stats.fn_verify_individual_votes_stats.add_sample(time_us);
-                (verified_batch, stats)
+                let prepared_msg = verified_batch.is_some().then_some(prepared_msg);
+                (verified_batch, stats, prepared_msg)
             }
         }
     }
+}
+
+/// Hashes the payload to the curve and prepares the result for pairing.
+fn prepare_msg(vote_payload_to_sign: &VotePayloadToSign) -> Arc<PreparedHashedMessage> {
+    let hashed_msg = vote_payload_to_sign.to_hashed_msg();
+    Arc::new(PreparedHashedMessage::from_hashed_message(&hashed_msg))
 }
 
 fn ban_invalid_vote_sender(
@@ -184,19 +204,18 @@ fn ban_invalid_vote_sender(
 /// caller falls back to individual vote verification so invalid votes can be
 /// identified precisely.
 ///
-/// Returns the optimistic verification outcome together with the distinct vote
-/// messages and their prepared payloads, which can be reused by the fallback
-/// path.
-// Return the prepared message on failure so fallback verification can reuse it
-// without another hash-to-curve operation. Boxing it would add an allocation to
-// this latency-sensitive path.
-#[allow(clippy::result_large_err)]
+/// Returns the aggregate signature if the optimistic verification succeeds,
+/// together with the prepared message of the payload, which the fallback path
+/// reuses. The prepared message is `cached_prepared_msg` if the caller has one.
+/// Otherwise it is computed while the signatures and public keys are
+/// aggregated.
 fn verify_votes_optimistic(
     vote_payload_to_sign: &VotePayloadToSign,
+    cached_prepared_msg: Option<Arc<PreparedHashedMessage>>,
     unverified_votes: &[UnverifiedVotePayload],
     stats: &mut VoteVerificationStats,
     thread_pool: &ThreadPool,
-) -> Result<SignatureProjective, HashedMessage> {
+) -> (Option<SignatureProjective>, Arc<PreparedHashedMessage>) {
     #[cfg(debug_assertions)]
     {
         let deduped = unverified_votes
@@ -217,29 +236,30 @@ fn verify_votes_optimistic(
     //
     // By verifying the aggregated signature against the aggregated public keys,
     // the number of pairings required is reduced to (1 + number of distinct messages).
-    let (signature_result, (pubkey_result, hashed_msg)) = thread_pool.join(
+    let (signature_result, (pubkey_result, prepared_msg)) = thread_pool.join(
         || aggregate_signatures(unverified_votes),
-        || {
-            thread_pool.join(
+        || match cached_prepared_msg {
+            Some(prepared_msg) => (aggregate_pubkeys_by_payload(unverified_votes), prepared_msg),
+            None => thread_pool.join(
                 || aggregate_pubkeys_by_payload(unverified_votes),
-                || vote_payload_to_sign.to_hashed_msg(),
-            )
+                || prepare_msg(vote_payload_to_sign),
+            ),
         },
     );
 
     let Ok(aggregate_signature) = signature_result else {
-        return Err(hashed_msg);
+        return (None, prepared_msg);
     };
 
     let Ok(aggregate_pubkey) = pubkey_result else {
-        return Err(hashed_msg);
+        return (None, prepared_msg);
     };
 
     // This pairing check is on the critical path of every batch, so run its
     // two Miller loops in parallel.
-    let verified = aggregate_pubkey.verify_signature_pre_hashed_with_join(
+    let verified = aggregate_pubkey.verify_signature_prepared_with_join(
         &aggregate_signature,
-        &hashed_msg,
+        &prepared_msg,
         |a, b| thread_pool.join(a, b),
     );
 
@@ -247,10 +267,10 @@ fn verify_votes_optimistic(
     stats
         .fn_verify_votes_optimistic_stats
         .add_sample(measure.as_us());
-    match verified {
-        Ok(()) => Ok(aggregate_signature),
-        Err(_) => Err(hashed_msg),
-    }
+    (
+        verified.is_ok().then_some(aggregate_signature),
+        prepared_msg,
+    )
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -288,10 +308,9 @@ fn verify_individual_votes(
     max_validators: usize,
     unverified_votes: &[UnverifiedVotePayload],
     sender_vote_account_pubkeys: Vec<Pubkey>,
-    hashed_msg: &HashedMessage,
+    prepared_msg: &PreparedHashedMessage,
     thread_pool: &ThreadPool,
 ) -> (Option<VerifiedBatch>, Vec<(Pubkey, BlsError)>) {
-    let prepared_msg = PreparedHashedMessage::from_hashed_message(hashed_msg);
     let (aggregates, sender_vote_account_pubkeys, failed) = thread_pool.install(|| {
         unverified_votes
             .into_par_iter()
@@ -301,7 +320,7 @@ fn verify_individual_votes(
                 |(mut verified, mut sender_vote_account_pubkeys, mut failed),
                  (unverified_vote, sender_vote_account_pubkey)| {
                     let sender_identity_pubkey = unverified_vote.sender_identity_pubkey;
-                    match unverified_vote.verify(max_validators, Either::Right(&prepared_msg)) {
+                    match unverified_vote.verify(max_validators, prepared_msg, None) {
                         Ok(aggregate) => {
                             verified.push(aggregate);
                             sender_vote_account_pubkeys.push(sender_vote_account_pubkey);
@@ -343,23 +362,22 @@ impl UnverifiedVotePayload {
     fn verify(
         &self,
         max_validators: usize,
-        msg: Either<(&[u8], &ThreadPool), &PreparedHashedMessage>,
+        prepared_msg: &PreparedHashedMessage,
+        thread_pool: Option<&ThreadPool>,
     ) -> Result<VoteAggregate, BlsError> {
         let signature = SignatureAffine::try_from(self.vote_message.signature)?;
-        match msg {
+        match thread_pool {
             // A vote verified on its own runs the two Miller loops of its
             // pairing check in parallel. The fallback path does not, since it
             // already verifies its votes in parallel.
-            Either::Left((bytes, thread_pool)) => self
+            Some(thread_pool) => self.sender_bls_pubkey.verify_signature_prepared_with_join(
+                &signature,
+                prepared_msg,
+                |a, b| thread_pool.join(a, b),
+            ),
+            None => self
                 .sender_bls_pubkey
-                .verify_signature_pre_hashed_with_join(
-                    &signature,
-                    &HashedMessage::new(bytes),
-                    |a, b| thread_pool.join(a, b),
-                ),
-            Either::Right(prepared) => self
-                .sender_bls_pubkey
-                .verify_signature_prepared(&signature, prepared),
+                .verify_signature_prepared(&signature, prepared_msg),
         }?;
         let vote_msg = VoteMessage {
             vote: self.vote_message.vote,
@@ -371,5 +389,226 @@ impl UnverifiedVotePayload {
             max_validators,
             vote_msg,
         ))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+mod tests {
+    use {
+        super::*,
+        agave_votor_messages::wire::get_vote_payload_to_sign,
+        agave_votor_transport::endpoint::{BanCommand, stub_ban_channel_for_tests},
+        rayon::ThreadPoolBuilder,
+        solana_bls_signatures::{BLS_SIGNATURE_AFFINE_SIZE, Keypair as BLSKeypair, Signature},
+    };
+
+    const NUM_VALIDATORS: usize = 6;
+    const SHRED_VERSION: u16 = 42;
+
+    #[derive(Clone, Copy)]
+    enum Signer {
+        /// Signs the payload of the vote.
+        Valid,
+        /// Signs the payload of another vote.
+        OtherPayload,
+        /// Sends bytes that are not a curve point.
+        NotAPoint,
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        verified_batch: Option<VerifiedBatch>,
+        optimistic_verification_succeeded: u64,
+        optimistic_verification_failed: u64,
+        num_individual_verified: usize,
+        banned: Vec<Pubkey>,
+    }
+
+    struct TestValidators {
+        bls_keypairs: Vec<BLSKeypair>,
+        identity_pubkeys: Vec<Pubkey>,
+        vote_account_pubkeys: Vec<Pubkey>,
+        thread_pool: ThreadPool,
+    }
+
+    impl TestValidators {
+        fn new() -> Self {
+            Self {
+                bls_keypairs: (0..NUM_VALIDATORS).map(|_| BLSKeypair::new()).collect(),
+                identity_pubkeys: (0..NUM_VALIDATORS).map(|_| Pubkey::new_unique()).collect(),
+                vote_account_pubkeys: (0..NUM_VALIDATORS).map(|_| Pubkey::new_unique()).collect(),
+                thread_pool: ThreadPoolBuilder::new().num_threads(4).build().unwrap(),
+            }
+        }
+
+        /// Verifies a batch of votes for `vote` from the ranks in `signers`.
+        fn verify(
+            &self,
+            vote: Vote,
+            signers: &[(usize, Signer)],
+            cached_prepared_msg: Option<Arc<PreparedHashedMessage>>,
+        ) -> (Outcome, Option<Arc<PreparedHashedMessage>>) {
+            let payload = get_vote_payload_to_sign(vote, SHRED_VERSION);
+            let other_payload =
+                get_vote_payload_to_sign(Vote::new_skip_vote(vote.slot() + 1), SHRED_VERSION);
+            let mut votes = signers.iter().map(|&(rank, signer)| {
+                let bls_keypair = &self.bls_keypairs[rank];
+                let signature = match signer {
+                    Signer::Valid => bls_keypair.sign(&payload).into(),
+                    Signer::OtherPayload => bls_keypair.sign(&other_payload).into(),
+                    Signer::NotAPoint => Signature([0; BLS_SIGNATURE_AFFINE_SIZE]),
+                };
+                let unverified_vote = UnverifiedVotePayload {
+                    vote_message: UnverifiedVoteMessage {
+                        vote,
+                        signature,
+                        shred_version: SHRED_VERSION,
+                    },
+                    sender_bls_pubkey: bls_keypair.public,
+                    sender_identity_pubkey: self.identity_pubkeys[rank],
+                    rank: rank as u16,
+                    stake: NonZeroStake::new(100 + rank as u64).unwrap(),
+                };
+                (unverified_vote, self.vote_account_pubkeys[rank])
+            });
+            let (first_vote, first_vote_account_pubkey) = votes.next().unwrap();
+            let mut batch = UnverifiedBatch::new(
+                VotePayloadToSign::new_from_vote(vote, SHRED_VERSION),
+                first_vote,
+                first_vote_account_pubkey,
+            );
+            for (unverified_vote, vote_account_pubkey) in votes {
+                batch.push(unverified_vote, vote_account_pubkey);
+            }
+
+            let (ban_sender, mut ban_receiver) = stub_ban_channel_for_tests(NUM_VALIDATORS);
+            let (verified_batch, stats, prepared_msg) = batch.verify(
+                NUM_VALIDATORS,
+                cached_prepared_msg,
+                &ban_sender,
+                &self.thread_pool,
+            );
+            let mut banned = Vec::new();
+            while let Ok(BanCommand { peer, .. }) = ban_receiver.try_recv() {
+                banned.push(peer);
+            }
+            assert_eq!(stats.banning_validator.0, banned.len() as u64);
+            let outcome = Outcome {
+                verified_batch,
+                optimistic_verification_succeeded: stats.optimistic_verification_succeeded.0,
+                optimistic_verification_failed: stats.optimistic_verification_failed.0,
+                num_individual_verified: stats.num_individual_verified.0,
+                banned,
+            };
+            (outcome, prepared_msg)
+        }
+    }
+
+    /// Verifies the votes without a cached prepared message, with an independently prepared
+    /// one, and with the one that the first verification returned, and checks that all three give
+    /// the same result.
+    fn check_cached_prepared_msg(
+        validators: &TestValidators,
+        signers: &[(usize, Signer)],
+        expected_verified: &[usize],
+        expected_banned: &[usize],
+    ) {
+        let vote = Vote::new_skip_vote(42);
+        let (outcome, returned_msg) = validators.verify(vote, signers, None);
+        let num_aggregates = outcome
+            .verified_batch
+            .as_ref()
+            .map_or(0, VerifiedBatch::len);
+        let num_verified = if outcome.optimistic_verification_succeeded > 0 {
+            // One aggregate holds all the votes.
+            assert_eq!(num_aggregates, 1);
+            assert_eq!(outcome.num_individual_verified, 0);
+            signers.len()
+        } else {
+            // One aggregate for each valid vote.
+            assert_eq!(num_aggregates, outcome.num_individual_verified);
+            outcome.num_individual_verified
+        };
+        assert_eq!(num_verified, expected_verified.len());
+        let expected_banned: Vec<_> = expected_banned
+            .iter()
+            .map(|&rank| validators.identity_pubkeys[rank])
+            .collect();
+        assert_eq!(outcome.banned, expected_banned);
+        // The message is returned for caching only if at least one vote is valid.
+        assert_eq!(returned_msg.is_some(), !expected_verified.is_empty());
+
+        let cached_msg = Arc::new(PreparedHashedMessage::new(&get_vote_payload_to_sign(
+            vote,
+            SHRED_VERSION,
+        )));
+        let (cached_outcome, cached_returned_msg) =
+            validators.verify(vote, signers, Some(cached_msg.clone()));
+        assert_eq!(cached_outcome, outcome);
+        assert_eq!(cached_returned_msg.is_some(), returned_msg.is_some());
+        if let Some(cached_returned_msg) = cached_returned_msg {
+            assert!(Arc::ptr_eq(&cached_returned_msg, &cached_msg));
+        }
+
+        if let Some(returned_msg) = returned_msg {
+            let (reused_outcome, _) = validators.verify(vote, signers, Some(returned_msg));
+            assert_eq!(reused_outcome, outcome);
+        }
+    }
+
+    #[test]
+    fn test_single_vote_with_cached_prepared_msg() {
+        let validators = TestValidators::new();
+        check_cached_prepared_msg(&validators, &[(0, Signer::Valid)], &[0], &[]);
+        check_cached_prepared_msg(&validators, &[(1, Signer::OtherPayload)], &[], &[1]);
+        check_cached_prepared_msg(&validators, &[(2, Signer::NotAPoint)], &[], &[2]);
+    }
+
+    #[test]
+    fn test_optimistic_verification_with_cached_prepared_msg() {
+        let validators = TestValidators::new();
+        let signers: Vec<_> = (0..NUM_VALIDATORS)
+            .map(|rank| (rank, Signer::Valid))
+            .collect();
+        check_cached_prepared_msg(&validators, &signers, &[0, 1, 2, 3, 4, 5], &[]);
+    }
+
+    #[test]
+    fn test_fallback_verification_with_cached_prepared_msg() {
+        let validators = TestValidators::new();
+        check_cached_prepared_msg(
+            &validators,
+            &[
+                (0, Signer::Valid),
+                (1, Signer::OtherPayload),
+                (2, Signer::Valid),
+                (3, Signer::OtherPayload),
+            ],
+            &[0, 2],
+            &[1, 3],
+        );
+        // The signatures cannot be aggregated.
+        check_cached_prepared_msg(
+            &validators,
+            &[
+                (3, Signer::Valid),
+                (4, Signer::NotAPoint),
+                (5, Signer::Valid),
+            ],
+            &[3, 5],
+            &[4],
+        );
+        // No vote is valid, so nothing is returned for caching.
+        check_cached_prepared_msg(
+            &validators,
+            &[
+                (0, Signer::OtherPayload),
+                (2, Signer::NotAPoint),
+                (4, Signer::OtherPayload),
+            ],
+            &[],
+            &[0, 2, 4],
+        );
     }
 }

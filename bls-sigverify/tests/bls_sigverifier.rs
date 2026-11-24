@@ -1415,6 +1415,91 @@ fn test_banlist_updates_for_invalid_votes() {
     }
 }
 
+/// Waits for `count` ban requests and returns the banned pubkeys.
+fn receive_bans(ctx: &mut TestContext, count: usize) -> HashSet<Pubkey> {
+    let deadline = Instant::now() + RECEIVE_TIMEOUT;
+    let mut banned = HashSet::new();
+    while banned.len() < count {
+        match ctx.ban_receiver.try_recv() {
+            Ok(BanCommand { peer, .. }) => {
+                banned.insert(peer);
+            }
+            Err(_) => {
+                assert!(Instant::now() < deadline, "timed out waiting for bans");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    banned
+}
+
+#[test]
+fn test_votes_for_one_payload_across_passes() {
+    let mut ctx = TestContext::new();
+    let shred_version = ctx.cluster_info.my_shred_version();
+    let vote = Vote::new_skip_vote(42);
+    let valid_payload = get_vote_payload_to_sign(vote, shred_version);
+    let invalid_payload = get_vote_payload_to_sign(Vote::new_skip_vote(99), shred_version);
+    // (rank, whether the signature is valid) for each pass. The sigverifier caches the prepared
+    // message of a payload after a pass with a valid vote for it, so the first pass leaves nothing
+    // cached, and the later passes verify against the cached message: aggregated, with a
+    // fallback to individual verification, and a single vote.
+    let passes: [&[(usize, bool)]; 4] = [
+        &[(0, false)],
+        &[(1, true), (2, true)],
+        &[(3, true), (4, false), (5, true)],
+        &[(6, true)],
+    ];
+    for pass in passes {
+        let messages: Vec<_> = pass
+            .iter()
+            .map(|&(rank, valid)| {
+                let keypair = &ctx.validator_keypairs[rank];
+                let payload = if valid {
+                    &valid_payload
+                } else {
+                    &invalid_payload
+                };
+                let message = ConsensusMessage::Vote(VoteMessage {
+                    vote,
+                    signature: keypair.bls_keypair.sign(payload).into(),
+                    rank: rank as u16,
+                    stake: NonZeroStake::new(123).unwrap(),
+                });
+                (message, keypair.node_keypair.pubkey())
+            })
+            .collect();
+        ctx.send_datagrams(messages_to_datagrams(&messages, shred_version));
+
+        // Wait for the results of each pass before sending the next one.
+        let expected: Vec<_> = pass
+            .iter()
+            .filter(|(_, valid)| *valid)
+            .map(|&(rank, _)| (vote, rank))
+            .collect();
+        let expected_banned: HashSet<_> = pass
+            .iter()
+            .filter(|(_, valid)| !*valid)
+            .map(|&(rank, _)| ctx.validator_keypairs[rank].node_keypair.pubkey())
+            .collect();
+        if expected.is_empty() {
+            assert_eq!(
+                receive_bans(&mut ctx, expected_banned.len()),
+                expected_banned
+            );
+            expect_no_receive(&ctx.pool_receiver);
+        } else {
+            let (aggregates, _) = receive_messages(&ctx.pool_receiver, expected.len(), 0);
+            assert_verified_votes(&aggregates, &expected);
+            assert_eq!(
+                receive_bans(&mut ctx, expected_banned.len()),
+                expected_banned
+            );
+        }
+    }
+    assert!(ctx.banned_pubkeys().is_empty());
+}
+
 #[test]
 fn test_banlist_updates_for_invalid_certificates() {
     let mut ctx = TestContext::new();
