@@ -1,8 +1,12 @@
 use {
-    crate::{bank::Bank, validated_reward_certificate::ValidatedRewardCert},
+    crate::{
+        bank::{Bank, rewards_calculation_thread_pool},
+        validated_reward_certificate::ValidatedRewardCert,
+    },
     agave_votor_messages::migration::AG_MIGRATION_EPOCH_CREDIT,
     epoch_inflation_account_state::{EpochInflationAccountState, EpochInflationState},
     log::info,
+    rayon::{ThreadPool, prelude::*},
     solana_account::{AccountSharedData, ReadableAccount},
     solana_clock::{Epoch, Slot},
     solana_pubkey::Pubkey,
@@ -351,7 +355,71 @@ fn allocate_updated_accounts(
     Ok(Some(HashMap::with_capacity(max_validators)))
 }
 
+/// The least number of validators that one thread of [`update_accounts_parallel`] works on.
+///
+/// With fewer than twice this many validators, [`update_accounts`] runs on the calling thread.
+const MIN_VALIDATORS_PER_THREAD: usize = 32;
+
+/// Builds the vote state of `validator` and updates it with the certificates.
+///
+/// Returns `None` if the vote state could not be built or was not updated. Adds the leader's
+/// share of the validator's reward to `leader_reward`.
+fn update_vote_state(
+    reward_state: &Option<RewardState>,
+    final_cert_state: &Option<FinalCertState>,
+    vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
+    validator: Pubkey,
+    leader_reward: &mut u64,
+) -> Result<Option<VoteState>, RewardStateError> {
+    let Some(mut vote_state) = VoteState::try_new(vote_accounts, validator) else {
+        return Ok(None);
+    };
+    let account_updated = match (reward_state, final_cert_state) {
+        (None, None) => false,
+        (Some(state), None) => state.update_account(&mut vote_state, leader_reward)?,
+        (None, Some(state)) => state.update_account(&mut vote_state),
+        (Some(reward_state), Some(final_state)) => {
+            let reward_updated = reward_state.update_account(&mut vote_state, leader_reward)?;
+            let final_cert_updated = final_state.update_account(&mut vote_state);
+            reward_updated || final_cert_updated
+        }
+    };
+    Ok(account_updated.then_some(vote_state))
+}
+
+/// Updates the vote states of `validators`, pays the leader and serializes the updated vote
+/// states.
+///
+/// Uses the rewards calculation thread pool when there are enough validators. The order of the
+/// returned accounts is not specified.
 fn update_accounts(
+    reward_state: &Option<RewardState>,
+    final_cert_state: &Option<FinalCertState>,
+    vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
+    updated_accounts: HashMap<Pubkey, VoteState>,
+    validators: impl Iterator<Item = Pubkey>,
+) -> Result<Vec<(Pubkey, AccountSharedData)>, CalcVoteRewardUpdateVoteStatesError> {
+    let validators = validators.collect::<Vec<_>>();
+    if validators.len() < 2 * MIN_VALIDATORS_PER_THREAD {
+        update_accounts_serial(
+            reward_state,
+            final_cert_state,
+            vote_accounts,
+            updated_accounts,
+            validators.into_iter(),
+        )
+    } else {
+        update_accounts_parallel(
+            rewards_calculation_thread_pool(),
+            reward_state,
+            final_cert_state,
+            vote_accounts,
+            &validators,
+        )
+    }
+}
+
+fn update_accounts_serial(
     reward_state: &Option<RewardState>,
     final_cert_state: &Option<FinalCertState>,
     vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
@@ -360,21 +428,13 @@ fn update_accounts(
 ) -> Result<Vec<(Pubkey, AccountSharedData)>, CalcVoteRewardUpdateVoteStatesError> {
     let mut leader_reward = 0;
     for validator in validators {
-        let Some(mut vote_state) = VoteState::try_new(vote_accounts, validator) else {
-            continue;
-        };
-        let account_updated = match (reward_state, final_cert_state) {
-            (None, None) => false,
-            (Some(state), None) => state.update_account(&mut vote_state, &mut leader_reward)?,
-            (None, Some(state)) => state.update_account(&mut vote_state),
-            (Some(reward_state), Some(final_state)) => {
-                let reward_updated =
-                    reward_state.update_account(&mut vote_state, &mut leader_reward)?;
-                let final_cert_updated = final_state.update_account(&mut vote_state);
-                reward_updated || final_cert_updated
-            }
-        };
-        if account_updated {
+        if let Some(vote_state) = update_vote_state(
+            reward_state,
+            final_cert_state,
+            vote_accounts,
+            validator,
+            &mut leader_reward,
+        )? {
             updated_accounts.insert(vote_state.vote_pubkey, vote_state);
         }
     }
@@ -402,6 +462,74 @@ fn update_accounts(
         .into_values()
         .filter_map(|vote_state| vote_state.serialize())
         .collect())
+}
+
+/// Returns the same accounts as [`update_accounts_serial`], using `thread_pool`.
+///
+/// Each thread builds, updates and serializes the vote states of a range of `validators` and
+/// adds up the leader's share of their rewards. The leader's vote state is serialized last, on
+/// the calling thread, when the whole leader reward is known.
+fn update_accounts_parallel(
+    thread_pool: &ThreadPool,
+    reward_state: &Option<RewardState>,
+    final_cert_state: &Option<FinalCertState>,
+    vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
+    validators: &[Pubkey],
+) -> Result<Vec<(Pubkey, AccountSharedData)>, CalcVoteRewardUpdateVoteStatesError> {
+    let leader_vote_pubkey = reward_state.as_ref().map(|state| state.leader_vote_pubkey);
+    let ranges = thread_pool.install(|| {
+        validators
+            .par_iter()
+            .with_min_len(MIN_VALIDATORS_PER_THREAD)
+            .try_fold(
+                || (Vec::new(), None, 0),
+                |(mut accounts, mut leader_vote_state, mut leader_reward),
+                 &validator|
+                 -> Result<_, RewardStateError> {
+                    if let Some(vote_state) = update_vote_state(
+                        reward_state,
+                        final_cert_state,
+                        vote_accounts,
+                        validator,
+                        &mut leader_reward,
+                    )? {
+                        if Some(validator) == leader_vote_pubkey {
+                            leader_vote_state = Some(vote_state);
+                        } else {
+                            accounts.extend(vote_state.serialize());
+                        }
+                    }
+                    Ok((accounts, leader_vote_state, leader_reward))
+                },
+            )
+            .collect::<Vec<_>>()
+    });
+
+    let mut accounts = Vec::with_capacity(validators.len());
+    let mut leader_vote_state = None;
+    let mut leader_reward = 0u64;
+    // The ranges are in the order of `validators` and each one ends at its first error, so the
+    // first error here is the one that the serial loop returns.
+    for range in ranges {
+        let (range_accounts, range_leader_vote_state, range_leader_reward) = range?;
+        accounts.extend(range_accounts);
+        leader_vote_state = leader_vote_state.or(range_leader_vote_state);
+        leader_reward = leader_reward.saturating_add(range_leader_reward);
+    }
+
+    // all validators have been processed, can pay leader rewards now.
+    if let Some(state) = reward_state
+        && let Some(leader_reward) = NonZero::new(leader_reward)
+    {
+        if leader_vote_state.is_none() {
+            leader_vote_state = VoteState::try_new(vote_accounts, state.leader_vote_pubkey);
+        }
+        if let Some(vote_state) = &mut leader_vote_state {
+            state.update_leader(vote_state, leader_reward);
+        }
+    }
+    accounts.extend(leader_vote_state.and_then(VoteState::serialize));
+    Ok(accounts)
 }
 
 /// Calculates voting rewards based on the `reward_cert` and updates fields in the vote account
@@ -576,7 +704,8 @@ mod tests {
             reward_certificate::NUM_SLOTS_FOR_REWARD,
         },
         bitvec::prelude::*,
-        rand::seq::IndexedRandom,
+        rand::{Rng, seq::IndexedRandom},
+        rayon::ThreadPoolBuilder,
         solana_account::{
             Account, ReadableAccount, WritableAccount, state_traits::StateMutWincode as _,
         },
@@ -598,7 +727,7 @@ mod tests {
             sync::{Arc, RwLock},
             time::{SystemTime, UNIX_EPOCH},
         },
-        test_case::test_matrix,
+        test_case::{test_case, test_matrix},
     };
 
     fn new_bank_for_tests(
@@ -733,11 +862,11 @@ mod tests {
         (validator_reward, leader_reward)
     }
 
-    #[test]
-    fn calculate_and_pay_works() {
+    #[test_case(10; "serial")]
+    #[test_case(100; "parallel")]
+    fn calculate_and_pay_works(num_validators_to_reward: u64) {
         let num_validators = 100;
         let per_validator_stake = LAMPORTS_PER_SOL * 100;
-        let num_validators_to_reward = 10;
 
         let validator_keypairs = (0..num_validators)
             .map(|_| ValidatorVoteKeypairs::new_rand())
@@ -1708,5 +1837,292 @@ mod tests {
     #[test]
     fn test_straddled_rewards_fit_flat_epoch_budget() {
         run_straddle_boundary(true);
+    }
+
+    /// Returns a genesis config with `num_validators` validators of different stakes.
+    fn genesis_config_with_validators(
+        num_validators: u64,
+    ) -> (GenesisConfig, Vec<ValidatorVoteKeypairs>) {
+        let validator_keypairs = (0..num_validators)
+            .map(|_| ValidatorVoteKeypairs::new_rand())
+            .collect::<Vec<_>>();
+        let stakes = (1..=num_validators).map(|i| i * LAMPORTS_PER_SOL).collect();
+        let mut genesis_config =
+            create_genesis_config_with_vote_accounts(1_000_000_000, &validator_keypairs, stakes)
+                .genesis_config;
+        genesis_config.epoch_schedule = EpochSchedule::without_warmup();
+        genesis_config.rent = Rent::default();
+        (genesis_config, validator_keypairs)
+    }
+
+    /// Returns a bank that can pay the rewards of slot `bank.slot() - NUM_SLOTS_FOR_REWARD`.
+    fn new_reward_bank(
+        genesis_config: &GenesisConfig,
+        leader: SlotLeader,
+    ) -> (Arc<Bank>, Arc<RwLock<BankForks>>) {
+        let (prev_bank, bank_forks) = new_bank_for_tests(leader, genesis_config);
+        let slot = prev_bank
+            .epoch_schedule
+            .get_first_slot_in_epoch(prev_bank.epoch() + 1)
+            + NUM_SLOTS_FOR_REWARD;
+        (new_bank_from_parent(prev_bank, slot), bank_forks)
+    }
+
+    fn now_nanos() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+    }
+
+    fn sorted(
+        accounts: Result<Vec<(Pubkey, AccountSharedData)>, CalcVoteRewardUpdateVoteStatesError>,
+    ) -> Vec<(Pubkey, AccountSharedData)> {
+        let mut accounts = accounts.unwrap();
+        accounts.sort_unstable_by_key(|(pubkey, _)| *pubkey);
+        accounts
+    }
+
+    #[test]
+    fn update_accounts_parallel_matches_serial() {
+        let num_validators = 200;
+        let (genesis_config, validator_keypairs) = genesis_config_with_validators(num_validators);
+        let vote_pubkeys = validator_keypairs
+            .iter()
+            .map(|keypairs| keypairs.vote_keypair.pubkey())
+            .collect::<Vec<_>>();
+        let slot_leader = SlotLeader {
+            id: validator_keypairs[0].node_keypair.pubkey(),
+            vote_address: vote_pubkeys[0],
+        };
+        let (bank, _bank_forks) = new_reward_bank(&genesis_config, slot_leader);
+        let reward_slot = bank.slot() - NUM_SLOTS_FOR_REWARD;
+        let final_slot = bank.slot() - 1;
+        let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut rng = rand::rng();
+
+        for _ in 0..20 {
+            // Random sets of validators, with some pubkeys that have no vote account.
+            let mut random_validators = || {
+                let share = [0.0, 0.1, 0.5, 0.9, 1.0].choose(&mut rng).copied().unwrap();
+                let num_unknown = rng.random_range(0..4);
+                let mut validators = vote_pubkeys
+                    .iter()
+                    .copied()
+                    .filter(|_| rng.random_bool(share))
+                    .collect::<HashSet<_>>();
+                validators.extend((0..num_unknown).map(|_| Pubkey::new_unique()));
+                validators
+            };
+            let reward_validators = random_validators();
+            let signers = random_validators();
+            // The leader can be in either set, in none or have no vote account.
+            let leader_vote_pubkey = if rng.random_bool(0.9) {
+                *vote_pubkeys.choose(&mut rng).unwrap()
+            } else {
+                Pubkey::new_unique()
+            };
+            let block_producer_time_nanos = now_nanos();
+            let reward_state = || {
+                Some(RewardState {
+                    leader_vote_pubkey,
+                    ..RewardState::try_new(
+                        &bank,
+                        reward_slot,
+                        &reward_validators,
+                        block_producer_time_nanos,
+                    )
+                    .unwrap()
+                })
+            };
+            let final_cert_state = || {
+                Some(FinalCertState::new(
+                    &bank,
+                    &signers,
+                    final_slot,
+                    block_producer_time_nanos,
+                ))
+            };
+            let vote_accounts = bank.vote_accounts();
+
+            let mut updated_accounts = Vec::new();
+            for (reward_state, final_cert_state, validators) in [
+                (
+                    reward_state(),
+                    None,
+                    reward_validators.iter().copied().collect::<Vec<_>>(),
+                ),
+                (None, final_cert_state(), signers.iter().copied().collect()),
+                (
+                    reward_state(),
+                    final_cert_state(),
+                    reward_validators.union(&signers).copied().collect(),
+                ),
+            ] {
+                let serial = sorted(update_accounts_serial(
+                    &reward_state,
+                    &final_cert_state,
+                    &vote_accounts,
+                    HashMap::new(),
+                    validators.iter().copied(),
+                ));
+                let parallel = sorted(update_accounts_parallel(
+                    &thread_pool,
+                    &reward_state,
+                    &final_cert_state,
+                    &vote_accounts,
+                    &validators,
+                ));
+                assert_eq!(parallel, serial);
+                updated_accounts = parallel;
+            }
+            // Start the next round from the updated vote states.
+            bank.store_accounts((bank.slot(), updated_accounts.as_slice()), None);
+        }
+    }
+
+    #[test]
+    fn update_accounts_parallel_returns_first_error() {
+        let num_validators = 200;
+        let (genesis_config, validator_keypairs) = genesis_config_with_validators(num_validators);
+        let slot_leader = SlotLeader {
+            id: validator_keypairs[0].node_keypair.pubkey(),
+            vote_address: validator_keypairs[0].vote_keypair.pubkey(),
+        };
+        let (bank, _bank_forks) = new_reward_bank(&genesis_config, slot_leader);
+        let reward_slot = bank.slot() - NUM_SLOTS_FOR_REWARD;
+        let reward_validators = validator_keypairs
+            .iter()
+            .map(|keypairs| keypairs.vote_keypair.pubkey())
+            .collect::<HashSet<_>>();
+        let validators = reward_validators.iter().copied().collect::<Vec<_>>();
+        let vote_accounts = bank.vote_accounts();
+        let thread_pool = ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut rng = rand::rng();
+
+        for _ in 0..20 {
+            // Leave a few validators out of the vote accounts of the reward slot.
+            let num_missing = rng.random_range(1..=5);
+            let missing = validators
+                .choose_multiple(&mut rng, num_missing)
+                .copied()
+                .collect::<HashSet<_>>();
+            let reward_state =
+                RewardState::try_new(&bank, reward_slot, &reward_validators, now_nanos()).unwrap();
+            let reward_slot_accounts = reward_state
+                .accounts
+                .iter()
+                .filter(|(pubkey, _)| !missing.contains(*pubkey))
+                .map(|(pubkey, entry)| (*pubkey, entry.clone()))
+                .collect::<HashMap<_, _>>();
+            let reward_state = Some(RewardState {
+                accounts: &reward_slot_accounts,
+                ..reward_state
+            });
+
+            let serial = update_accounts_serial(
+                &reward_state,
+                &None,
+                &vote_accounts,
+                HashMap::new(),
+                validators.iter().copied(),
+            );
+            let first_missing = validators
+                .iter()
+                .find(|pubkey| missing.contains(*pubkey))
+                .unwrap();
+            let Err(CalcVoteRewardUpdateVoteStatesError::RewardState(
+                RewardStateError::MissingRewardSlotValidator { pubkey, .. },
+            )) = &serial
+            else {
+                panic!("unexpected result {serial:?}");
+            };
+            assert_eq!(pubkey, first_missing);
+
+            let parallel = update_accounts_parallel(
+                &thread_pool,
+                &reward_state,
+                &None,
+                &vote_accounts,
+                &validators,
+            );
+            assert_eq!(format!("{parallel:?}"), format!("{serial:?}"));
+        }
+    }
+
+    #[test]
+    fn calc_vote_rewards_parallel_gives_serial_bank_hash() {
+        let num_validators = 200;
+        let (genesis_config, validator_keypairs) = genesis_config_with_validators(num_validators);
+        let vote_pubkeys = validator_keypairs
+            .iter()
+            .map(|keypairs| keypairs.vote_keypair.pubkey())
+            .collect::<Vec<_>>();
+        let slot_leader = SlotLeader {
+            id: validator_keypairs[0].node_keypair.pubkey(),
+            vote_address: vote_pubkeys[0],
+        };
+        let (parallel_bank, _parallel_bank_forks) = new_reward_bank(&genesis_config, slot_leader);
+        let (serial_bank, _serial_bank_forks) = new_reward_bank(&genesis_config, slot_leader);
+        let reward_slot = parallel_bank.slot() - NUM_SLOTS_FOR_REWARD;
+        let final_slot = parallel_bank.slot() - 1;
+        let mut rng = rand::rng();
+        let reward_validators = vote_pubkeys
+            .choose_multiple(&mut rng, 150)
+            .copied()
+            .collect::<Vec<_>>();
+        let signers = vote_pubkeys
+            .choose_multiple(&mut rng, 150)
+            .copied()
+            .collect::<HashSet<_>>();
+        let block_producer_time_nanos = now_nanos();
+
+        let num_updated = calc_vote_rewards_update_vote_states(
+            &parallel_bank,
+            Some(ValidatedRewardCert::new_for_tests(
+                reward_slot,
+                reward_validators.clone(),
+            )),
+            Some((&signers, final_slot)),
+            block_producer_time_nanos,
+        )
+        .unwrap();
+
+        let reward_validators = reward_validators.into_iter().collect::<HashSet<_>>();
+        let reward_state = Some(
+            RewardState::try_new(
+                &serial_bank,
+                reward_slot,
+                &reward_validators,
+                block_producer_time_nanos,
+            )
+            .unwrap(),
+        );
+        let final_cert_state = Some(FinalCertState::new(
+            &serial_bank,
+            &signers,
+            final_slot,
+            block_producer_time_nanos,
+        ));
+        let accounts = update_accounts_serial(
+            &reward_state,
+            &final_cert_state,
+            &serial_bank.vote_accounts(),
+            HashMap::new(),
+            reward_validators.union(&signers).copied(),
+        )
+        .unwrap();
+        serial_bank.store_accounts((serial_bank.slot(), accounts.as_slice()), None);
+        assert_eq!(num_updated, accounts.len());
+
+        for vote_pubkey in &vote_pubkeys {
+            assert_eq!(
+                parallel_bank.get_account(vote_pubkey),
+                serial_bank.get_account(vote_pubkey)
+            );
+        }
+        parallel_bank.freeze();
+        serial_bank.freeze();
+        assert_eq!(parallel_bank.hash(), serial_bank.hash());
     }
 }
