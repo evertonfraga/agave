@@ -89,8 +89,11 @@ impl Config {
                     .long("validators")
                     .value_name("N")
                     .takes_value(true)
-                    .default_value("700")
-                    .help("Number of staked validators"),
+                    .default_value("665")
+                    .help(
+                        "Number of staked validators. Mainnet certificates ranked 657-670 \
+                         validators in the sampled epochs",
+                    ),
             )
             .arg(
                 Arg::with_name("slots")

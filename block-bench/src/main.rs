@@ -243,6 +243,11 @@ impl TxClass {
 /// tail is memos as long as a packet allows.
 const MIX_MAINNET: &str = "transfer=13,token=45,token2022=5,ata=20,memo=12,two-signer=5";
 const MIX_TRANSFER: &str = "transfer=50,token=50";
+/// `mainnet` adds heavy memo transactions until a block reaches this estimate.
+/// Mainnet blocks sampled after the Alpenglow switch (240 blocks from epochs
+/// 1065-1093) consumed 12.5M compute units at the median and 14.9M on average,
+/// while the mainnet mix alone comes to about 1.2M per block.
+const MAINNET_CU_TARGET: u64 = 13_000_000;
 /// `cu20m` is the mainnet mix plus heavy memo transactions up to this target.
 const CU20M_TARGET: u64 = 20_000_000;
 
@@ -290,7 +295,7 @@ fn parse_range(value: &str) -> Result<(usize, usize), String> {
 
 fn parse_mix(value: &str) -> Result<(Vec<(TxClass, u32)>, u64), String> {
     let (spec, cu_target) = match value {
-        "mainnet" => (MIX_MAINNET, 0),
+        "mainnet" => (MIX_MAINNET, MAINNET_CU_TARGET),
         "transfer" => (MIX_TRANSFER, 0),
         "cu20m" => (MIX_MAINNET, CU20M_TARGET),
         spec => (spec, 0),
@@ -358,7 +363,8 @@ fn parse_args() -> Config {
                 .takes_value(true)
                 .help(
                     "Add heavy memo transactions until the estimated consumed compute units per \
-                     block reach this value [default: 20000000 for --mix cu20m, else 0]",
+                     block reach this value [default: 13000000 for --mix mainnet, 20000000 for \
+                     --mix cu20m, else 0]",
                 ),
         )
         .arg(
@@ -372,7 +378,7 @@ fn parse_args() -> Config {
             Arg::new("slots")
                 .long("slots")
                 .takes_value(true)
-                .default_value("150")
+                .default_value("180")
                 .help("Measured slots"),
         )
         .arg(
@@ -386,15 +392,21 @@ fn parse_args() -> Config {
             Arg::new("txs")
                 .long("txs")
                 .takes_value(true)
-                .default_value("600")
-                .help("Transactions per block from the mix, before any --cu-target tail"),
+                .default_value("350")
+                .help(
+                    "Transactions per block from the mix, before any --cu-target tail. Sampled \
+                     mainnet blocks held 350 on average",
+                ),
         )
         .arg(
             Arg::new("entry_txs")
                 .long("entry-txs")
                 .takes_value(true)
-                .default_value("1-8")
-                .help("Transactions per entry, drawn uniformly from MIN-MAX"),
+                .default_value("1")
+                .help(
+                    "Transactions per entry, drawn uniformly from MIN-MAX. 97% of sampled mainnet \
+                     entries held one transaction",
+                ),
         )
         .arg(
             Arg::new("memo_bytes")
@@ -407,8 +419,11 @@ fn parse_args() -> Config {
             Arg::new("voters")
                 .long("voters")
                 .takes_value(true)
-                .default_value("1000")
-                .help("Staked validators with BLS keys; all of them sign every certificate"),
+                .default_value("665")
+                .help(
+                    "Staked validators with BLS keys; all of them sign every certificate. Mainnet \
+                     certificates ranked 657-670 validators in the sampled epochs",
+                ),
         )
         .arg(
             Arg::new("payers")
