@@ -1915,19 +1915,29 @@ impl JsonRpcRequestProcessor {
     ) -> Option<TransactionStatus> {
         let (slot, status) = bank.get_signature_status_slot(&signature)?;
 
-        let optimistically_confirmed_bank = self.bank(Some(CommitmentConfig::confirmed()));
-        let optimistically_confirmed =
-            optimistically_confirmed_bank.get_signature_status_slot(&signature);
-
-        let r_block_commitment_cache = self.block_commitment_cache.read().unwrap();
-        let confirmations = if r_block_commitment_cache.root() >= slot
-            && is_finalized(&r_block_commitment_cache, bank, &self.blockstore, slot)
+        let confirmations = {
+            let r_block_commitment_cache = self.block_commitment_cache.read().unwrap();
+            if r_block_commitment_cache.root() >= slot
+                && is_finalized(&r_block_commitment_cache, bank, &self.blockstore, slot)
+            {
+                None
+            } else {
+                r_block_commitment_cache
+                    .get_confirmation_count(slot)
+                    .or(Some(0))
+            }
+        };
+        // The confirmed bank only separates confirmed from processed statuses,
+        // so finalized statuses skip its status cache search.
+        let confirmation_status = if confirmations.is_none() {
+            TransactionConfirmationStatus::Finalized
+        } else if self
+            .bank(Some(CommitmentConfig::confirmed()))
+            .has_signature(&signature)
         {
-            None
+            TransactionConfirmationStatus::Confirmed
         } else {
-            r_block_commitment_cache
-                .get_confirmation_count(slot)
-                .or(Some(0))
+            TransactionConfirmationStatus::Processed
         };
         let err = status.clone().err();
         Some(TransactionStatus {
@@ -1935,13 +1945,7 @@ impl JsonRpcRequestProcessor {
             status,
             confirmations,
             err,
-            confirmation_status: if confirmations.is_none() {
-                Some(TransactionConfirmationStatus::Finalized)
-            } else if optimistically_confirmed.is_some() {
-                Some(TransactionConfirmationStatus::Confirmed)
-            } else {
-                Some(TransactionConfirmationStatus::Processed)
-            },
+            confirmation_status: Some(confirmation_status),
         })
     }
 
@@ -7956,6 +7960,91 @@ pub mod tests {
             Some(
                 r#"{"jsonrpc":"2.0","error":{"code":-32011,"message":"Transaction history is not available from this node"},"id":1}"#.to_string(),
             )
+        );
+    }
+
+    #[test]
+    fn test_rpc_get_signature_statuses_confirmation_status() {
+        let rpc = RpcHandler::start();
+        let rent_exempt_amount = rpc.working_bank().get_minimum_balance_for_rent_exemption(0);
+        let bank1 = rpc.advance_bank_to_confirmed_slot(1);
+        let signature1 = bank1
+            .transfer(rent_exempt_amount, &rpc.mint_keypair, &Pubkey::new_unique())
+            .unwrap();
+        let bank2 = rpc.advance_bank_to_confirmed_slot(2);
+        let signature2 = bank2
+            .transfer(rent_exempt_amount, &rpc.mint_keypair, &Pubkey::new_unique())
+            .unwrap();
+        let unknown_signature = Signature::from([7; 64]);
+
+        let mut block_commitment = BlockCommitment::default();
+        block_commitment.increase_confirmation_stake(1, 10);
+        let set_root = |root: Slot| {
+            *rpc.block_commitment_cache.write().unwrap() = BlockCommitmentCache::new(
+                HashMap::from([(2, block_commitment.clone())]),
+                10,
+                CommitmentSlots {
+                    slot: 2,
+                    root,
+                    highest_confirmed_slot: root,
+                    highest_super_majority_root: root,
+                },
+            );
+        };
+        let get_signature_statuses = || -> Vec<Option<TransactionStatus>> {
+            let request = create_test_request(
+                "getSignatureStatuses",
+                Some(json!([[
+                    signature1.to_string(),
+                    signature2.to_string(),
+                    unknown_signature.to_string(),
+                ]])),
+            );
+            let response: RpcResponse<Vec<Option<TransactionStatus>>> =
+                parse_success_result(rpc.handle_request_sync(request));
+            assert_eq!(response.context.slot, 2);
+            response.value
+        };
+        let status = |slot, confirmations, confirmation_status| {
+            Some(TransactionStatus {
+                slot,
+                confirmations,
+                status: Ok(()),
+                err: None,
+                confirmation_status: Some(confirmation_status),
+            })
+        };
+
+        // Slot 1 is finalized and slot 2 is not. The confirmed bank is still the
+        // root bank, which has neither signature.
+        set_root(1);
+        assert_eq!(
+            get_signature_statuses(),
+            [
+                status(1, None, TransactionConfirmationStatus::Finalized),
+                status(2, Some(1), TransactionConfirmationStatus::Processed),
+                None,
+            ]
+        );
+
+        rpc.meta.optimistically_confirmed_bank.write().unwrap().bank = bank2;
+        assert_eq!(
+            get_signature_statuses(),
+            [
+                status(1, None, TransactionConfirmationStatus::Finalized),
+                status(2, Some(1), TransactionConfirmationStatus::Confirmed),
+                None,
+            ]
+        );
+
+        set_root(2);
+        assert_eq!(
+            get_signature_statuses(),
+            [
+                status(1, None, TransactionConfirmationStatus::Finalized),
+                status(2, None, TransactionConfirmationStatus::Finalized),
+                None,
+            ]
         );
     }
 
