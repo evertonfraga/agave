@@ -1,0 +1,238 @@
+pub mod bytes;
+pub mod conversion;
+pub mod points;
+
+pub use bytes::{
+    ProofOfPossession, ProofOfPossessionCompressed, BLS_PROOF_OF_POSSESSION_AFFINE_BASE64_SIZE,
+    BLS_PROOF_OF_POSSESSION_AFFINE_SIZE, BLS_PROOF_OF_POSSESSION_COMPRESSED_BASE64_SIZE,
+    BLS_PROOF_OF_POSSESSION_COMPRESSED_SIZE,
+};
+#[cfg(not(target_os = "solana"))]
+pub use points::{
+    AsProofOfPossessionAffine, AsProofOfPossessionProjective, ProofOfPossessionAffine,
+    ProofOfPossessionProjective, VerifiableProofOfPossession,
+};
+
+/// Domain separation tag used when hashing public keys to G2 in the proof of
+/// possession signing and verification functions. See the
+/// [standard](https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-bls-signature-05#section-4.2.3).
+pub const POP_DST: &[u8] = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{
+            hash::hash_pop_to_projective,
+            keypair::Keypair,
+            pubkey::{Pubkey, PubkeyAffine, PubkeyCompressed, PubkeyProjective, VerifyPop},
+        },
+        blstrs::{G1Projective, Scalar},
+        core::str::FromStr,
+        group::Group,
+        std::string::ToString,
+    };
+
+    #[test]
+    fn test_proof_of_possession() {
+        let keypair = Keypair::new();
+        let proof_projective = keypair.proof_of_possession(None);
+
+        let pubkey_affine: PubkeyAffine = *keypair.public;
+        let pubkey_projective: PubkeyProjective = pubkey_affine.into();
+        let pubkey_uncompressed: Pubkey = pubkey_affine.into();
+        let pubkey_compressed: PubkeyCompressed = pubkey_affine.into();
+
+        let proof_affine: ProofOfPossessionAffine = proof_projective.into();
+        let proof_uncompressed: ProofOfPossession = proof_affine.into();
+        let proof_compressed: ProofOfPossessionCompressed = proof_affine.into();
+
+        // Verify with PubkeyProjective
+        assert!(proof_projective.verify(&pubkey_projective, None).is_ok());
+        assert!(proof_affine.verify(&pubkey_projective, None).is_ok());
+        assert!(proof_uncompressed.verify(&pubkey_projective, None).is_ok());
+        assert!(proof_compressed.verify(&pubkey_projective, None).is_ok());
+
+        // Verify with PubkeyAffine
+        assert!(proof_projective.verify(&pubkey_affine, None).is_ok());
+        assert!(proof_affine.verify(&pubkey_affine, None).is_ok());
+        assert!(proof_uncompressed.verify(&pubkey_affine, None).is_ok());
+        assert!(proof_compressed.verify(&pubkey_affine, None).is_ok());
+
+        // Verify with Pubkey (Uncompressed Bytes)
+        assert!(proof_projective.verify(&pubkey_uncompressed, None).is_ok());
+        assert!(proof_affine.verify(&pubkey_uncompressed, None).is_ok());
+        assert!(proof_uncompressed
+            .verify(&pubkey_uncompressed, None)
+            .is_ok());
+        assert!(proof_compressed.verify(&pubkey_uncompressed, None).is_ok());
+
+        // Verify with PubkeyCompressed (Compressed Bytes)
+        assert!(proof_projective.verify(&pubkey_compressed, None).is_ok());
+        assert!(proof_affine.verify(&pubkey_compressed, None).is_ok());
+        assert!(proof_uncompressed.verify(&pubkey_compressed, None).is_ok());
+        assert!(proof_compressed.verify(&pubkey_compressed, None).is_ok());
+    }
+
+    #[test]
+    fn proof_of_possession_from_str() {
+        let proof_of_possession = ProofOfPossession([1; BLS_PROOF_OF_POSSESSION_AFFINE_SIZE]);
+        let proof_of_possession_string = proof_of_possession.to_string();
+        let proof_of_possession_from_string =
+            ProofOfPossession::from_str(&proof_of_possession_string).unwrap();
+        assert_eq!(proof_of_possession, proof_of_possession_from_string);
+
+        let proof_of_possession_compressed =
+            ProofOfPossessionCompressed([1; BLS_PROOF_OF_POSSESSION_COMPRESSED_SIZE]);
+        let proof_of_possession_compressed_string = proof_of_possession_compressed.to_string();
+        let proof_of_possession_compressed_from_string =
+            ProofOfPossessionCompressed::from_str(&proof_of_possession_compressed_string).unwrap();
+        assert_eq!(
+            proof_of_possession_compressed,
+            proof_of_possession_compressed_from_string
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serialize_and_deserialize_proof_of_possession() {
+        let keypair = Keypair::new();
+        let custom_payload = b"SIMD-0387-context-data";
+
+        let proof_custom = keypair.proof_of_possession(Some(custom_payload));
+        let original: ProofOfPossession = proof_custom.into();
+        let serialized = bincode::serialize(&original).unwrap();
+        let deserialized: ProofOfPossession = bincode::deserialize(&serialized).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serialize_and_deserialize_proof_of_possession_compressed() {
+        let keypair = Keypair::new();
+        let custom_payload = b"SIMD-0387-context-data";
+
+        let proof_custom = keypair.proof_of_possession(Some(custom_payload));
+        let original: ProofOfPossessionCompressed = proof_custom.into();
+        let serialized = bincode::serialize(&original).unwrap();
+        let deserialized: ProofOfPossessionCompressed = bincode::deserialize(&serialized).unwrap();
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn test_proof_of_possession_with_custom_payload() {
+        let keypair = Keypair::new();
+        let custom_payload = b"SIMD-0387-context-data";
+
+        let proof_custom = keypair.proof_of_possession(Some(custom_payload));
+        assert!(keypair
+            .public
+            .verify_proof_of_possession(&proof_custom, Some(custom_payload))
+            .is_ok());
+
+        assert!(keypair
+            .public
+            .verify_proof_of_possession(&proof_custom, None) // try verify with `None`
+            .is_err());
+
+        let wrong_payload = b"wrong-context";
+        assert!(keypair
+            .public
+            // try verify with wrong payload
+            .verify_proof_of_possession(&proof_custom, Some(wrong_payload))
+            .is_err());
+
+        // verify standard PoP behavior
+        let proof_standard = keypair.proof_of_possession(None);
+        // standard passes with None
+        assert!(keypair
+            .public
+            .verify_proof_of_possession(&proof_standard, None)
+            .is_ok());
+        // standard fails with custom payload
+        assert!(keypair
+            .public
+            .verify_proof_of_possession(&proof_standard, Some(custom_payload))
+            .is_err());
+    }
+
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn test_custom_payload_pop_is_bound_to_pubkey() {
+        let honest = Keypair::new();
+        let payload = b"SIMD-0387-context-data";
+        let honest_pop = honest.proof_of_possession(Some(payload));
+        let hashed_payload = hash_pop_to_projective(payload);
+
+        let attacker_scalar = Scalar::from(7u64);
+        let rogue_pubkey = PubkeyProjective(
+            (G1Projective::generator() * attacker_scalar)
+                - PubkeyProjective::from(*honest.public).0,
+        );
+        let rogue_pop =
+            ProofOfPossessionProjective((hashed_payload * attacker_scalar) - honest_pop.0);
+
+        assert!(rogue_pubkey
+            .verify_proof_of_possession(&rogue_pop, Some(payload))
+            .is_err());
+    }
+
+    #[test]
+    fn test_verify_proof_of_possession_with_raw_bytes() {
+        let keypair = Keypair::new();
+        let pop_projective = keypair.proof_of_possession(None);
+        let pubkey_bytes = keypair.public.to_bytes_compressed();
+        let pop_bytes = pop_projective.to_bytes_compressed();
+
+        assert!(pubkey_bytes
+            .verify_proof_of_possession(&pop_bytes, None)
+            .is_ok());
+        assert!(keypair
+            .public
+            .verify_proof_of_possession(&pop_bytes, None)
+            .is_ok());
+
+        // malleable public key
+        let mut bad_pubkey_bytes = pubkey_bytes;
+        bad_pubkey_bytes[0] ^= 0xFF;
+
+        let result = bad_pubkey_bytes.verify_proof_of_possession(&pop_bytes, None);
+        assert!(result.is_err());
+
+        // malleable PoP
+        let mut bad_pop_bytes = pop_bytes;
+        bad_pop_bytes[0] ^= 0xFF;
+
+        let result = pubkey_bytes.verify_proof_of_possession(&bad_pop_bytes, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_identity_pop_behavior() {
+        use {blstrs::G2Projective, group::Group};
+
+        let keypair = Keypair::new();
+
+        // Deserializing an identity PoP should succeed
+        let id_pop_proj = ProofOfPossessionProjective(G2Projective::identity());
+        let id_pop_compressed: ProofOfPossessionCompressed = (&id_pop_proj).into();
+        let id_pop_recovered: Result<ProofOfPossessionProjective, _> =
+            ProofOfPossessionProjective::try_from(&id_pop_compressed);
+        assert!(
+            id_pop_recovered.is_ok(),
+            "Identity PoPs must be allowed to deserialize"
+        );
+        assert_eq!(id_pop_proj, id_pop_recovered.unwrap());
+
+        // PoP Verification with an identity Pubkey must fail
+        let id_pubkey_proj = PubkeyProjective::identity();
+        let valid_pop = keypair.proof_of_possession(None);
+
+        // Verification uses VerifyPop, which is automatically implemented for PubkeyProjective
+        let verify_result = id_pubkey_proj.verify_proof_of_possession(&valid_pop, None);
+        assert!(
+            verify_result.is_err(),
+            "PoP Verification with identity public key must fail"
+        );
+    }
+}
