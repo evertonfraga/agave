@@ -59,9 +59,49 @@ impl Reset for AlignedMemory<{ HOST_ALIGN }> {
         let slice = self.as_slice_mut();
         let len = len.min(slice.len());
         if let Some(head) = slice.get_mut(..len) {
-            head.fill(0);
+            // Most chunks are still zero from the previous reset. On x86_64,
+            // memset of these buffers is limited by the stores, so only the
+            // nonzero chunks are cleared. On aarch64, glibc's memset clears
+            // whole cache lines with DC ZVA, which is faster than reading the
+            // buffer to find them.
+            if cfg!(target_arch = "x86_64") {
+                clear_nonzero_chunks(head);
+            } else {
+                head.fill(0);
+            }
         }
     }
+}
+
+/// Size of the chunks that [`clear_nonzero_chunks`] checks and clears.
+const RESET_CHUNK_SIZE: usize = 4096;
+
+/// Sets all bytes of `buf` to zero, writing only the 4 KiB chunks that contain
+/// a nonzero byte.
+///
+/// A program usually writes to a few chunks of its stack and heap, and the
+/// other chunks are still zero from the previous reset.
+fn clear_nonzero_chunks(buf: &mut [u8]) {
+    for chunk in buf.chunks_mut(RESET_CHUNK_SIZE) {
+        if !is_zeroed(chunk) {
+            chunk.fill(0);
+        }
+    }
+}
+
+/// Returns whether all bytes of `bytes` are zero.
+///
+/// The bytes are read as u64 words, 64 words (512 bytes) at a time, and the
+/// check stops at the first block that has a nonzero word.
+fn is_zeroed(bytes: &[u8]) -> bool {
+    let (blocks, rest) = bytes.as_chunks::<512>();
+    blocks.iter().all(|block| {
+        let (words, _) = block.as_chunks::<8>();
+        words
+            .iter()
+            .fold(0, |acc, word| acc | u64::from_ne_bytes(*word))
+            == 0
+    }) && rest.iter().all(|byte| *byte == 0)
 }
 
 pub struct CallFrameBuffer(Box<[CallFrame; MAX_CALL_DEPTH]>);
@@ -166,7 +206,10 @@ impl VmMemoryPool {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use {
+        super::*,
+        rand::{Rng, SeedableRng, rngs::StdRng},
+    };
 
     #[derive(Debug, Eq, PartialEq)]
     struct Item(u8, u8);
@@ -195,6 +238,70 @@ mod test {
 
         let heap = pool.get_heap(big);
         assert!(heap.as_slice().iter().all(|byte| *byte == 0));
+    }
+
+    /// Clears the first `len` bytes of copies of `bytes` with
+    /// `clear_nonzero_chunks` and with `Reset`, and checks both against
+    /// `fill(0)`.
+    fn assert_reset_matches_fill(bytes: &[u8], len: usize) {
+        let head = len.min(bytes.len());
+        let mut expected = bytes.to_vec();
+        expected.get_mut(..head).unwrap().fill(0);
+
+        let mut cleared = bytes.to_vec();
+        clear_nonzero_chunks(cleared.get_mut(..head).unwrap());
+        assert_eq!(cleared, expected);
+
+        let mut memory = AlignedMemory::<{ HOST_ALIGN }>::from_slice(bytes);
+        memory.reset(len);
+        assert_eq!(memory.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn test_reset_single_nonzero_byte() {
+        // A full chunk, then a partial chunk of one 512-byte block and a tail
+        // that does not end on a word.
+        let size = RESET_CHUNK_SIZE + 512 + 77;
+        for position in 0..size {
+            let mut bytes = vec![0; size];
+            *bytes.get_mut(position).unwrap() = 1;
+            assert_reset_matches_fill(&bytes, size);
+            // The byte is past `len` and must stay.
+            assert_reset_matches_fill(&bytes, position);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn test_reset_matches_fill() {
+        let mut rng = StdRng::seed_from_u64(0);
+        let stack_size = solana_sbpf::vm::get_stack_frame_size() * MAX_CALL_DEPTH;
+        let heap_size = MAX_HEAP_FRAME_BYTES as usize;
+        for _ in 0..500 {
+            let size = match rng.random_range(0..4) {
+                0 => stack_size,
+                1 => heap_size,
+                _ => rng.random_range(0..4 * RESET_CHUNK_SIZE),
+            };
+            let mut bytes = vec![0; size];
+            // Single bytes and runs of random bytes, like the stack frames and
+            // heap allocations that a program writes.
+            if size > 0 {
+                for _ in 0..rng.random_range(0..8) {
+                    let start = rng.random_range(0..size);
+                    if rng.random_bool(0.5) {
+                        *bytes.get_mut(start).unwrap() = rng.random_range(1..=u8::MAX);
+                    } else {
+                        let end = rng.random_range(start..=size.min(start + 2 * RESET_CHUNK_SIZE));
+                        rng.fill(bytes.get_mut(start..end).unwrap());
+                    }
+                }
+            }
+            // `reset` clamps a `len` past the end of the memory.
+            let len = rng.random_range(0..=size + 8);
+            assert_reset_matches_fill(&bytes, len);
+        }
     }
 
     #[test]
