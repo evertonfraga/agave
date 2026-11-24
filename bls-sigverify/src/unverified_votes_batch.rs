@@ -80,7 +80,10 @@ impl UnverifiedBatch {
                 let serialized_vote = wincode::serialize(&self.vote_payload_to_sign).unwrap();
                 let sender_identity_pubkey = unverified_vote.sender_identity_pubkey;
                 (
-                    unverified_vote.verify(max_validators, Either::Left(&serialized_vote)),
+                    unverified_vote.verify(
+                        max_validators,
+                        Either::Left((&serialized_vote, thread_pool)),
+                    ),
                     sender_identity_pubkey,
                 )
             });
@@ -232,7 +235,13 @@ fn verify_votes_optimistic(
         return Err(hashed_msg);
     };
 
-    let verified = aggregate_pubkey.verify_signature_pre_hashed(&aggregate_signature, &hashed_msg);
+    // This pairing check is on the critical path of every batch, so run its
+    // two Miller loops in parallel.
+    let verified = aggregate_pubkey.verify_signature_pre_hashed_with_join(
+        &aggregate_signature,
+        &hashed_msg,
+        |a, b| thread_pool.join(a, b),
+    );
 
     measure.stop();
     stats
@@ -334,11 +343,20 @@ impl UnverifiedVotePayload {
     fn verify(
         &self,
         max_validators: usize,
-        msg: Either<&[u8], &PreparedHashedMessage>,
+        msg: Either<(&[u8], &ThreadPool), &PreparedHashedMessage>,
     ) -> Result<VoteAggregate, BlsError> {
         let signature = SignatureAffine::try_from(self.vote_message.signature)?;
         match msg {
-            Either::Left(bytes) => self.sender_bls_pubkey.verify_signature(&signature, bytes),
+            // A vote verified on its own runs the two Miller loops of its
+            // pairing check in parallel. The fallback path does not, since it
+            // already verifies its votes in parallel.
+            Either::Left((bytes, thread_pool)) => self
+                .sender_bls_pubkey
+                .verify_signature_pre_hashed_with_join(
+                    &signature,
+                    &HashedMessage::new(bytes),
+                    |a, b| thread_pool.join(a, b),
+                ),
             Either::Right(prepared) => self
                 .sender_bls_pubkey
                 .verify_signature_prepared(&signature, prepared),

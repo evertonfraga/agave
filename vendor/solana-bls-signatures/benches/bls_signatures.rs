@@ -1,0 +1,270 @@
+use {
+    criterion::{criterion_group, criterion_main, Criterion},
+    solana_bls_signatures::{
+        hash::{HashedMessage, PreparedHashedMessage},
+        keypair::Keypair,
+        pubkey::{PopVerified, Pubkey, PubkeyProjective, VerifyPop, VerifySignature},
+        scalar::Scalar,
+        signature::{Signature, SignatureAffineUnchecked, SignatureProjective},
+    },
+    std::hint::black_box,
+};
+
+// Benchmark for verifying a single signature
+fn bench_single_signature(c: &mut Criterion) {
+    let mut group = c.benchmark_group("single_signature");
+    let keypair = Keypair::new();
+    let message = b"test message";
+
+    group.bench_function("signature_generation", |b| {
+        b.iter(|| black_box(keypair.sign(message)));
+    });
+
+    let signature = keypair.sign(message);
+    group.bench_function("verify_signature", |b| {
+        b.iter(|| black_box(keypair.public.verify_signature(&signature, message)).unwrap());
+    });
+    group.finish();
+}
+
+// Worst-case benchmark for aggregate signature verification
+fn bench_aggregate(c: &mut Criterion) {
+    let mut group = c.benchmark_group("aggregate_verify");
+    // Test with a range of validator counts to simulate different scales
+    for num_validators in [2, 4, 8, 16, 32, 64, 128, 256].iter() {
+        let message = b"test message";
+        let keypairs: Vec<Keypair> = (0..*num_validators).map(|_| Keypair::new()).collect();
+        let pubkey_bytes: Vec<Pubkey> =
+            keypairs.iter().map(|kp| Pubkey::from(*kp.public)).collect();
+        let verified_pubkeys: Vec<PopVerified<Pubkey>> = pubkey_bytes
+            .iter()
+            .map(|p| unsafe { PopVerified::new_unchecked(*p) })
+            .collect();
+        let signature_bytes: Vec<Signature> = keypairs
+            .iter()
+            .map(|kp| Signature::from(kp.sign(message)))
+            .collect();
+
+        // Generate random scalars for MSM benchmark
+        let scalars: Vec<Scalar> = (0..*num_validators).map(|_| Scalar::random()).collect();
+
+        // Benchmark for aggregating multiple signatures
+        group.bench_function(format!("{num_validators} signature aggregation"), |b| {
+            b.iter(|| black_box(SignatureProjective::aggregate(signature_bytes.iter())));
+        });
+
+        // Benchmark for aggregating multiple signatures with scalars (MSM)
+        group.bench_function(
+            format!("{num_validators} signature aggregation with scalars"),
+            |b| {
+                b.iter(|| {
+                    let unchecked_sigs: Vec<SignatureAffineUnchecked> = signature_bytes
+                        .iter()
+                        .map(|bytes| SignatureAffineUnchecked::try_from(bytes).expect("valid sig"))
+                        .collect();
+
+                    let aggregated_proj = SignatureProjective::aggregate_with_weights(
+                        unchecked_sigs.iter(),
+                        scalars.iter(),
+                    )
+                    .expect("msm failed");
+
+                    let aggregated_unchecked = SignatureAffineUnchecked::from(aggregated_proj);
+                    black_box(
+                        aggregated_unchecked
+                            .verify_subgroup()
+                            .expect("verify failed"),
+                    );
+                });
+            },
+        );
+
+        #[cfg(feature = "parallel")]
+        {
+            group.bench_function(
+                format!("{num_validators} parallel signature aggregation"),
+                |b| {
+                    use rayon::prelude::*;
+                    b.iter(|| {
+                        black_box(SignatureProjective::par_aggregate(
+                            signature_bytes.par_iter(),
+                        ))
+                    });
+                },
+            );
+        }
+
+        // Benchmark for aggregating multiple public keys
+        group.bench_function(format!("{num_validators} pubkey aggregation"), |b| {
+            b.iter(|| black_box(PubkeyProjective::aggregate(verified_pubkeys.iter())));
+        });
+
+        #[cfg(feature = "parallel")]
+        {
+            group.bench_function(
+                format!("{num_validators} parallel pubkey aggregation"),
+                |b| {
+                    use rayon::prelude::*;
+                    b.iter(|| {
+                        black_box(PubkeyProjective::par_aggregate(verified_pubkeys.par_iter()))
+                    });
+                },
+            );
+        }
+
+        group.bench_function(
+            format!("{num_validators} sequential aggregate verification"),
+            |b| {
+                b.iter(|| {
+                    SignatureProjective::verify_aggregate(
+                        verified_pubkeys.iter(),
+                        signature_bytes.iter(),
+                        message,
+                    )
+                    .unwrap();
+                });
+            },
+        );
+
+        #[cfg(feature = "parallel")]
+        group.bench_function(
+            format!("{num_validators} parallel aggregate verification"),
+            |b| {
+                b.iter(|| {
+                    SignatureProjective::par_verify_aggregate(
+                        &verified_pubkeys,
+                        &signature_bytes,
+                        message,
+                    )
+                    .unwrap();
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+// Benchmark for generating a new keypair
+fn bench_key_generation(c: &mut Criterion) {
+    c.bench_function("key_generation", |b| b.iter(|| black_box(Keypair::new)));
+}
+
+// Benchmark for creating and verifying a proof of possession
+fn bench_proof_of_possession(c: &mut Criterion) {
+    let keypair = Keypair::new();
+    let pop = keypair.proof_of_possession(None);
+
+    c.bench_function("proof_of_possession_creation", |b| {
+        b.iter(|| black_box(keypair.proof_of_possession(None)));
+    });
+
+    c.bench_function("proof_of_possession_verification", |b| {
+        b.iter(|| {
+            black_box(keypair.public.verify_proof_of_possession(&pop, None)).unwrap();
+        })
+    });
+}
+
+// Benchmark for `verify_distinct` aggregate screening functions.
+fn bench_aggregate_screening(c: &mut Criterion) {
+    let mut group = c.benchmark_group("aggregate_screening");
+
+    for num_validators in [64, 128, 256, 512, 1024, 2048].iter() {
+        let keypairs: Vec<Keypair> = (0..*num_validators).map(|_| Keypair::new()).collect();
+        let pubkeys: Vec<PopVerified<Pubkey>> = keypairs
+            .iter()
+            .map(|kp| unsafe { PopVerified::new_unchecked((*kp.public).into()) })
+            .collect();
+
+        // Create a unique message for each validator
+        let messages: Vec<Vec<u8>> = (0..*num_validators)
+            .map(|i| format!("message_{i}").into_bytes())
+            .collect();
+
+        // Create a signature for each message
+        let signatures: Vec<Signature> = keypairs
+            .iter()
+            .zip(messages.iter())
+            .map(|(kp, msg)| kp.sign(msg).into())
+            .collect();
+
+        let hashed_messages: Vec<HashedMessage> =
+            messages.iter().map(|msg| HashedMessage::new(msg)).collect();
+        let prepared_hashed_messages: Vec<PreparedHashedMessage> = hashed_messages
+            .iter()
+            .map(PreparedHashedMessage::from_hashed_message)
+            .collect();
+
+        group.bench_function(
+            format!("{num_validators} sequential aggregate screening"),
+            |b| {
+                b.iter(|| {
+                    SignatureProjective::verify_distinct(
+                        pubkeys.iter(),
+                        signatures.iter(),
+                        messages.iter().map(Vec::as_slice),
+                    )
+                    .unwrap();
+                });
+            },
+        );
+
+        group.bench_function(
+            format!("{num_validators} sequential aggregate screening (pre-hashed)"),
+            |b| {
+                b.iter(|| {
+                    SignatureProjective::verify_distinct_pre_hashed(
+                        pubkeys.iter(),
+                        signatures.iter(),
+                        hashed_messages.iter(),
+                    )
+                    .unwrap();
+                });
+            },
+        );
+
+        group.bench_function(
+            format!("{num_validators} sequential aggregate screening (prepared)"),
+            |b| {
+                b.iter(|| {
+                    SignatureProjective::verify_distinct_prepared(
+                        pubkeys.iter(),
+                        signatures.iter(),
+                        prepared_hashed_messages.iter(),
+                    )
+                    .unwrap();
+                });
+            },
+        );
+
+        #[cfg(feature = "parallel")]
+        {
+            let message_refs: Vec<&[u8]> = messages.iter().map(|v| v.as_slice()).collect();
+
+            group.bench_function(
+                format!("{num_validators} parallel aggregate screening"),
+                |b| {
+                    b.iter(|| {
+                        SignatureProjective::par_verify_distinct(
+                            &pubkeys,
+                            &signatures,
+                            &message_refs,
+                        )
+                        .unwrap();
+                    });
+                },
+            );
+        }
+    }
+    group.finish()
+}
+
+criterion_group!(
+    benches,
+    bench_single_signature,
+    bench_aggregate,
+    bench_key_generation,
+    bench_proof_of_possession,
+    bench_aggregate_screening
+);
+criterion_main!(benches);
