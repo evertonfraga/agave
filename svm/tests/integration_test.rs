@@ -3444,8 +3444,11 @@ fn svm_metrics_accumulation() {
             &env.processing_config,
         );
 
-        // jit compilation only happens on non-windows && x86_64
-        #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
+        // jit compilation only happens on non-windows x86_64 and on aarch64 Linux
+        #[cfg(any(
+            all(not(target_os = "windows"), target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "aarch64")
+        ))]
         {
             assert_ne!(
                 result
