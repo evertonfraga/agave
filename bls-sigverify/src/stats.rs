@@ -46,6 +46,10 @@ pub(super) struct SigVerifierStats {
     pub(super) num_keep_vote_failed: Saturating<u64>,
     pub(super) vote_pool_duplicate: Saturating<u64>,
     pub(super) invalid_vote_banning_validator: Saturating<u64>,
+    /// Number of vote batches whose payload had a cached prepared message.
+    pub(super) prepared_msg_cache_hits: Saturating<u64>,
+    /// Number of vote batches whose payload had no cached prepared message.
+    pub(super) prepared_msg_cache_misses: Saturating<u64>,
     /// Last time the stats were reported.
     last_report: Instant,
 }
@@ -70,6 +74,8 @@ impl Default for SigVerifierStats {
             invalid_vote_banning_validator: Saturating(0),
             num_keep_vote_failed: Saturating(0),
             vote_pool_duplicate: Saturating(0),
+            prepared_msg_cache_hits: Saturating(0),
+            prepared_msg_cache_misses: Saturating(0),
             last_report: Instant::now(),
         }
     }
@@ -107,6 +113,8 @@ impl SigVerifierStats {
             invalid_vote_banning_validator,
             num_keep_vote_failed,
             vote_pool_duplicate,
+            prepared_msg_cache_hits,
+            prepared_msg_cache_misses,
             last_report: _,
         } = self;
         vote_stats.report();
@@ -171,6 +179,12 @@ impl SigVerifierStats {
             ),
             ("num_keep_vote_failed", num_keep_vote_failed.0, i64),
             ("vote_pool_duplicate", vote_pool_duplicate.0, i64),
+            ("prepared_msg_cache_hits", prepared_msg_cache_hits.0, i64),
+            (
+                "prepared_msg_cache_misses",
+                prepared_msg_cache_misses.0,
+                i64
+            ),
             ("num_pkts", num_pkts.0, i64),
         );
     }
