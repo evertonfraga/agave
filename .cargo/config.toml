@@ -5,5 +5,16 @@ rustflags = ["-Ctarget-cpu=x86-64-v2"]
 [target.aarch64-apple-darwin]
 rustflags = ["-Clinker-plugin-lto=no"]
 
+[env]
+# Build RocksDB with its ARMv8 CRC32C code on aarch64 Linux, with the flags
+# RocksDB's own CMake build uses. librocksdb-sys compiles that code only when
+# the compiler targets the CRC extension, which the base armv8-a target does not
+# include, and RocksDB selects it at run time on Linux only when
+# ROCKSDB_AUXV_GETAUXVAL_PRESENT is defined. Otherwise every WAL record is
+# checksummed with the table-based software CRC32C. cc-rs reads this variable
+# only when compiling C++ for aarch64-unknown-linux-gnu and appends it after the
+# flags set by build scripts. A value already set in the environment is kept.
+CXXFLAGS_aarch64_unknown_linux_gnu = "-march=armv8-a+crc+crypto -DROCKSDB_AUXV_GETAUXVAL_PRESENT"
+
 [alias]
 xtask = "run --manifest-path ci/xtask/Cargo.toml --bin xtask --"
