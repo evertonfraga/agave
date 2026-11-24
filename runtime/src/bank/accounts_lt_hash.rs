@@ -1,5 +1,5 @@
 use {
-    super::Bank,
+    super::{Bank, MAX_ALPENGLOW_VOTE_ACCOUNTS},
     agave_worker_pool::{WorkerPool, WorkerPoolConfig},
     crossbeam_queue::SegQueue,
     crossbeam_utils::{
@@ -11,15 +11,19 @@ use {
         iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator},
     },
     solana_account::{AccountSharedData, ReadableAccount},
-    solana_accounts_db::{accounts_db::AccountsDb, storable_accounts::StorableAccounts},
+    solana_accounts_db::{
+        accounts_db::AccountsDb, accounts_hash::AccountLtHash, storable_accounts::StorableAccounts,
+    },
     solana_lattice_hash::lt_hash::LtHash,
     solana_pubkey::Pubkey,
+    solana_vote_interface::state::VoteStateV4,
     std::{
         array,
         collections::hash_map::Entry,
         hint,
         mem::{self, size_of},
         num::NonZeroUsize,
+        ptr,
         sync::{
             Arc, LazyLock, Mutex,
             atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -400,9 +404,16 @@ impl AccountsLtHashAsyncProgress {
 
     /// Processes `update` and mixes the result into `accum_lt_hash`.
     ///
+    /// Takes the lt hash of the previous version from `lt_hash_cache` if the cache holds
+    /// that version, and caches the lt hash of the current version.
+    ///
     /// Note: Since an LtHash is large, `accum_lt_hash` is passed as an in-out parameter.
     /// This it to avoid Rust compiler bug that fails to perform return value optimization.
-    fn process(accum_lt_hash: &mut LtHash, update: &AccountsLtHashUpdate) {
+    fn process(
+        accum_lt_hash: &mut LtHash,
+        update: &AccountsLtHashUpdate,
+        lt_hash_cache: &VoteAccountsLtHashCache,
+    ) {
         let AccountsLtHashUpdate {
             address,
             prev_account,
@@ -410,12 +421,15 @@ impl AccountsLtHashAsyncProgress {
             has_large_version: _,
         } = update;
         if let Some(prev_account) = prev_account {
-            let prev_lt_hash = AccountsDb::lt_hash_account(prev_account, address);
+            let prev_lt_hash = lt_hash_cache
+                .get(address, prev_account)
+                .unwrap_or_else(|| AccountsDb::lt_hash_account(prev_account, address));
             accum_lt_hash.mix_out(&prev_lt_hash.0);
         }
         if let Some(curr_account) = curr_account {
             let curr_lt_hash = AccountsDb::lt_hash_account(curr_account, address);
             accum_lt_hash.mix_in(&curr_lt_hash.0);
+            lt_hash_cache.insert(address, curr_account, curr_lt_hash);
         }
     }
 
@@ -457,6 +471,22 @@ fn chunk_len(num_updates: usize) -> usize {
 
 /// Accounts at least this large take longer to hash than an extra spawn.
 const SPLIT_ACCOUNT_DATA_LEN: usize = 16 * 1024;
+
+/// The vote accounts lt hash cache is split into this many shards, each with its own lock,
+/// so the hashers rarely wait for each other.
+const NUM_LT_HASH_CACHE_SHARDS: usize = 64;
+
+/// The most vote accounts one shard of the vote accounts lt hash cache holds.
+///
+/// All shards together hold twice `MAX_ALPENGLOW_VOTE_ACCOUNTS`, the most vote accounts a
+/// block footer rewrites. An entry takes up to about 7 KiB with its account's data, so the
+/// cache stays under 30 MB.
+const MAX_LT_HASH_CACHE_SHARD_LEN: usize =
+    (2 * MAX_ALPENGLOW_VOTE_ACCOUNTS).div_ceil(NUM_LT_HASH_CACHE_SHARDS);
+
+/// Whether to also hash the accounts found in the vote accounts lt hash cache, and check
+/// the cached lt hash against the result. Unit tests check, so they compare both paths.
+const VERIFY_CACHED_LT_HASHES: bool = cfg!(test);
 
 /// Returns the global accounts lt hash manager.
 ///
@@ -694,6 +724,114 @@ impl AccountsLtHashUpdate {
     }
 }
 
+/// Returns the global vote accounts lt hash cache.
+fn vote_accounts_lt_hash_cache() -> &'static VoteAccountsLtHashCache {
+    static CACHE: LazyLock<VoteAccountsLtHashCache> = LazyLock::new(VoteAccountsLtHashCache::new);
+    &CACHE
+}
+
+/// Caches the lt hash of the last hashed version of each vote account.
+///
+/// Every Alpenglow block footer rewrites the vote accounts of the validators that voted,
+/// so the previous version that the next footer mixes out is usually the version that this
+/// footer mixed in. Taking its lt hash from the cache saves the hashers half the work of the
+/// footer's burst, which the freeze waits on.
+///
+/// An account's lt hash depends only on its address, lamports, data, executable flag and
+/// owner. The cache returns an entry only for a version that is equal in all of them, so it
+/// needs no slot or fork bookkeeping: an entry from another fork, or one that a transaction
+/// has replaced since, is a miss.
+struct VoteAccountsLtHashCache {
+    shards: [CachePadded<Mutex<LtHashCacheShard>>; NUM_LT_HASH_CACHE_SHARDS],
+}
+
+type LtHashCacheShard = ahash::HashMap<Pubkey, Box<CachedLtHash>>;
+
+/// A version of an account and its lt hash.
+struct CachedLtHash {
+    account: AccountSharedData,
+    lt_hash: AccountLtHash,
+}
+
+impl VoteAccountsLtHashCache {
+    fn new() -> Self {
+        Self {
+            shards: array::from_fn(|_| CachePadded::new(Mutex::default())),
+        }
+    }
+
+    /// Returns whether the cache takes `account`: a vote account no larger than a vote
+    /// state, which bounds the cache's memory.
+    fn is_cacheable(account: &AccountSharedData) -> bool {
+        solana_sdk_ids::vote::check_id(account.owner())
+            && account.data().len() <= VoteStateV4::size_of()
+    }
+
+    fn shard(&self, address: &Pubkey) -> &Mutex<LtHashCacheShard> {
+        // The leading bytes of addresses from `Pubkey::new_unique()` are a counter, so
+        // pick the shard by the last byte.
+        let index = usize::from(address.as_array()[31]) % NUM_LT_HASH_CACHE_SHARDS;
+        &self.shards[index]
+    }
+
+    /// Returns the lt hash of `account` at `address` if the cache holds this version of it.
+    fn get(&self, address: &Pubkey, account: &AccountSharedData) -> Option<AccountLtHash> {
+        if !Self::is_cacheable(account) {
+            return None;
+        }
+        let lt_hash = {
+            let shard = self.shard(address).lock().unwrap();
+            let cached = shard
+                .get(address)
+                .filter(|cached| has_same_lt_hash_input(&cached.account, account))?;
+            cached.lt_hash.clone()
+        };
+        if VERIFY_CACHED_LT_HASHES {
+            assert_eq!(
+                lt_hash,
+                AccountsDb::lt_hash_account(account, address),
+                "wrong cached lt hash for {address}",
+            );
+        }
+        Some(lt_hash)
+    }
+
+    /// Caches `lt_hash` as the lt hash of `account` at `address`.
+    fn insert(&self, address: &Pubkey, account: &AccountSharedData, lt_hash: AccountLtHash) {
+        if !Self::is_cacheable(account) {
+            return;
+        }
+        let mut shard = self.shard(address).lock().unwrap();
+        if let Some(cached) = shard.get_mut(address) {
+            cached.account = account.clone();
+            cached.lt_hash = lt_hash;
+            return;
+        }
+        if shard.len() >= MAX_LT_HASH_CACHE_SHARD_LEN {
+            // Vote accounts that are no longer written would keep the shard full for good.
+            shard.clear();
+        }
+        shard.insert(
+            *address,
+            Box::new(CachedLtHash {
+                account: account.clone(),
+                lt_hash,
+            }),
+        );
+    }
+}
+
+/// Returns whether `a` and `b` have the same lt hash at the same address.
+///
+/// The lt hash covers the lamports, data, executable flag and owner, not the rent epoch.
+fn has_same_lt_hash_input(a: &AccountSharedData, b: &AccountSharedData) -> bool {
+    a.lamports() == b.lamports()
+        && a.executable() == b.executable()
+        && a.owner() == b.owner()
+        // A version loaded from the write cache usually shares its data with the cached one.
+        && (ptr::eq(a.data(), b.data()) || a.data() == b.data())
+}
+
 /// Get the freelist of hashsets to use for seen accounts.
 fn seen_accounts_freelist() -> &'static HashSetFreelist<Pubkey> {
     // Derived empirically while observing an unstaked node on mnb.
@@ -832,8 +970,9 @@ impl AccountsLtHashChunk {
     /// Hashes the updates into the accumulator of the worker with `worker_id`.
     fn hash(&self, worker_id: usize) {
         let mut accumulator = self.async_progress.accumulators[worker_id].lock().unwrap();
+        let lt_hash_cache = vote_accounts_lt_hash_cache();
         for update in &self.updates {
-            AccountsLtHashAsyncProgress::process(&mut accumulator, update);
+            AccountsLtHashAsyncProgress::process(&mut accumulator, update, lt_hash_cache);
         }
     }
 }
@@ -879,6 +1018,7 @@ mod tests {
         agave_snapshots::snapshot_config::SnapshotConfig,
         agave_votor_messages::consensus_message::BlockId,
         ahash::HashSetExt as _,
+        solana_account::WritableAccount as _,
         solana_accounts_db::{
             accounts_db::{ACCOUNTS_DB_CONFIG_FOR_TESTING, AccountsDbConfig},
             accounts_index::{
@@ -1481,16 +1621,17 @@ mod tests {
         assert!(update(0, SPLIT_ACCOUNT_DATA_LEN).should_split());
         assert!(update(SPLIT_ACCOUNT_DATA_LEN, 0).should_split());
 
+        let lt_hash_cache = VoteAccountsLtHashCache::new();
         let mut curr_half = update(SPLIT_ACCOUNT_DATA_LEN, SPLIT_ACCOUNT_DATA_LEN + 1);
         let mut expected_lt_hash = LtHash::identity();
-        AccountsLtHashAsyncProgress::process(&mut expected_lt_hash, &curr_half);
+        AccountsLtHashAsyncProgress::process(&mut expected_lt_hash, &curr_half, &lt_hash_cache);
         let prev_half = curr_half.take_prev();
         assert!(prev_half.curr_account.is_none() && !prev_half.should_split());
         assert!(curr_half.prev_account.is_none() && !curr_half.should_split());
 
         let mut lt_hash = LtHash::identity();
-        AccountsLtHashAsyncProgress::process(&mut lt_hash, &prev_half);
-        AccountsLtHashAsyncProgress::process(&mut lt_hash, &curr_half);
+        AccountsLtHashAsyncProgress::process(&mut lt_hash, &prev_half, &lt_hash_cache);
+        AccountsLtHashAsyncProgress::process(&mut lt_hash, &curr_half, &lt_hash_cache);
         assert_eq!(lt_hash, expected_lt_hash);
     }
 
@@ -1570,6 +1711,7 @@ mod tests {
         let owner = Pubkey::default();
         let mut accounts: Vec<_> = (0..64).map(|_| (Pubkey::new_unique(), None)).collect();
         let async_progress = Arc::new(AccountsLtHashAsyncProgress::new());
+        let lt_hash_cache = VoteAccountsLtHashCache::new();
         let mut expected_lt_hash = LtHash::identity();
         // Rewrite every account once per round, in a bank's phases: spawn at setup,
         // queue for transactions, spawn at freeze.
@@ -1591,7 +1733,7 @@ mod tests {
                 .collect();
             // Hash the same updates serially, for reference.
             for update in &updates {
-                AccountsLtHashAsyncProgress::process(&mut expected_lt_hash, update);
+                AccountsLtHashAsyncProgress::process(&mut expected_lt_hash, update, &lt_hash_cache);
             }
             if spawn {
                 async_progress.add_deduped_count(updates.len());
@@ -1608,6 +1750,179 @@ mod tests {
         let mut lt_hash = LtHash::identity();
         async_progress.finish(&mut lt_hash);
         assert_eq!(lt_hash, expected_lt_hash);
+    }
+
+    /// The vote accounts lt hash cache returns an lt hash only for the version it holds.
+    #[test]
+    fn test_vote_accounts_lt_hash_cache() {
+        let lt_hash_cache = VoteAccountsLtHashCache::new();
+        let address = Pubkey::new_unique();
+        let account = AccountSharedData::new_with_data(
+            LAMPORTS_PER_SOL,
+            vec![7; VoteStateV4::size_of()],
+            &solana_sdk_ids::vote::id(),
+        );
+        let lt_hash = AccountsDb::lt_hash_account(&account, &address);
+        assert_eq!(lt_hash_cache.get(&address, &account), None);
+        lt_hash_cache.insert(&address, &account, lt_hash.clone());
+
+        // The cached version, whether it shares its data or not.
+        let copy = AccountSharedData::new_with_data(
+            account.lamports(),
+            account.data().to_vec(),
+            account.owner(),
+        );
+        for same_version in [&account, &copy] {
+            assert_eq!(
+                lt_hash_cache.get(&address, same_version),
+                Some(lt_hash.clone())
+            );
+        }
+        assert_eq!(lt_hash_cache.get(&Pubkey::new_unique(), &account), None);
+
+        // Versions with other lamports, data or executable flag.
+        let mut other_lamports = account.clone();
+        other_lamports.set_lamports(account.lamports() + 1);
+        let mut other_data = account.clone();
+        other_data.data_as_mut_slice()[0] ^= 1;
+        let mut other_executable = account.clone();
+        other_executable.set_executable(true);
+        for other_version in [&other_lamports, &other_data, &other_executable] {
+            assert_eq!(lt_hash_cache.get(&address, other_version), None);
+        }
+
+        // Accounts of other owners, and accounts larger than a vote state, are not cached.
+        let mut other_owner = account.clone();
+        other_owner.set_owner(Pubkey::new_unique());
+        let large = AccountSharedData::new_with_data(
+            account.lamports(),
+            vec![7; VoteStateV4::size_of() + 1],
+            account.owner(),
+        );
+        for uncacheable in [other_owner, large] {
+            let address = Pubkey::new_unique();
+            let lt_hash = AccountsDb::lt_hash_account(&uncacheable, &address);
+            lt_hash_cache.insert(&address, &uncacheable, lt_hash);
+            assert_eq!(lt_hash_cache.get(&address, &uncacheable), None);
+        }
+
+        // A newer version replaces the cached one.
+        let other_lt_hash = AccountsDb::lt_hash_account(&other_data, &address);
+        lt_hash_cache.insert(&address, &other_data, other_lt_hash.clone());
+        assert_eq!(lt_hash_cache.get(&address, &account), None);
+        assert_eq!(
+            lt_hash_cache.get(&address, &other_data),
+            Some(other_lt_hash)
+        );
+    }
+
+    /// A full shard of the vote accounts lt hash cache starts over.
+    #[test]
+    fn test_vote_accounts_lt_hash_cache_shard_len() {
+        let lt_hash_cache = VoteAccountsLtHashCache::new();
+        let account = AccountSharedData::new_with_data(1, vec![1; 8], &solana_sdk_ids::vote::id());
+        let shard = lt_hash_cache.shard(&Pubkey::new_unique());
+        let addresses: Vec<_> = iter::repeat_with(Pubkey::new_unique)
+            .filter(|address| ptr::eq(lt_hash_cache.shard(address), shard))
+            .take(MAX_LT_HASH_CACHE_SHARD_LEN + 1)
+            .collect();
+        let insert = |address| {
+            let lt_hash = AccountsDb::lt_hash_account(&account, address);
+            lt_hash_cache.insert(address, &account, lt_hash);
+        };
+        for address in &addresses[..MAX_LT_HASH_CACHE_SHARD_LEN] {
+            insert(address);
+        }
+        // Rewriting a cached account takes no room.
+        insert(&addresses[0]);
+        assert_eq!(shard.lock().unwrap().len(), MAX_LT_HASH_CACHE_SHARD_LEN);
+
+        let last_address = &addresses[MAX_LT_HASH_CACHE_SHARD_LEN];
+        insert(last_address);
+        assert_eq!(shard.lock().unwrap().len(), 1);
+        assert_eq!(lt_hash_cache.get(&addresses[0], &account), None);
+        assert!(lt_hash_cache.get(last_address, &account).is_some());
+    }
+
+    /// In unit tests, an update that finds a wrong lt hash in the cache panics.
+    #[test]
+    #[should_panic(expected = "wrong cached lt hash")]
+    fn test_vote_accounts_lt_hash_cache_verified_in_tests() {
+        let lt_hash_cache = VoteAccountsLtHashCache::new();
+        let address = Pubkey::new_unique();
+        let account = AccountSharedData::new_with_data(1, vec![1; 8], &solana_sdk_ids::vote::id());
+        lt_hash_cache.insert(&address, &account, AccountLtHash(LtHash::identity()));
+        let update = AccountsLtHashUpdate::new(address, Some(account), None);
+        AccountsLtHashAsyncProgress::process(&mut LtHash::identity(), &update, &lt_hash_cache);
+    }
+
+    /// Rewrites vote accounts in every slot, as the block footer does, on two forks. The
+    /// accounts lt hash, which takes previous versions from the vote accounts lt hash
+    /// cache, must equal the one calculated from the accounts index.
+    #[test_case(Features::None; "no features")]
+    #[test_case(Features::All; "all features")]
+    fn test_accounts_lt_hash_with_vote_account_rewrites(features: Features) {
+        let (genesis_config, _mint_keypair) = genesis_config_with(features);
+        let (bank0, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
+        let addresses: Vec<_> = iter::repeat_with(Pubkey::new_unique).take(64).collect();
+        let lamports = bank0.get_minimum_balance_for_rent_exemption(VoteStateV4::size_of());
+        let vote_account = |version: u8| {
+            AccountSharedData::new_with_data(
+                lamports + u64::from(version),
+                vec![version; VoteStateV4::size_of()],
+                &solana_sdk_ids::vote::id(),
+            )
+        };
+        let vote_accounts = |version| -> Vec<_> {
+            addresses
+                .iter()
+                .map(|address| (*address, vote_account(version)))
+                .collect()
+        };
+        let new_bank = |parent: &Arc<Bank>, slot| {
+            Bank::new_from_parent_with_bank_forks(
+                &bank_forks,
+                Arc::clone(parent),
+                SlotLeader::default(),
+                slot,
+            )
+        };
+        let freeze_and_check = |bank: &Bank| {
+            bank.freeze();
+            let calculated_accounts_lt_hash = bank
+                .rc
+                .accounts
+                .accounts_db
+                .calculate_accounts_lt_hash_at_startup_from_index(&bank.ancestors);
+            assert_eq!(
+                *bank.accounts_lt_hash.lock().unwrap(),
+                calculated_accounts_lt_hash,
+            );
+        };
+
+        // Slot 2 rewrites the vote accounts that slot 1 creates, so the cache holds the
+        // previous versions.
+        let bank1 = new_bank(&bank0, 1);
+        bank1.store_accounts((bank1.slot(), vote_accounts(1).as_slice()), None);
+        freeze_and_check(&bank1);
+        let bank2 = new_bank(&bank1, 2);
+        bank2.store_accounts((bank2.slot(), vote_accounts(2).as_slice()), None);
+        freeze_and_check(&bank2);
+
+        // Slot 3 forks off slot 1, so the cache holds other versions than the previous ones.
+        let bank3 = new_bank(&bank1, 3);
+        bank3.store_accounts((bank3.slot(), vote_accounts(3).as_slice()), None);
+        freeze_and_check(&bank3);
+
+        // Slot 4 builds on slot 2 and writes one vote account before rewriting all of them.
+        let bank4 = new_bank(&bank2, 4);
+        bank4.store_account(&addresses[0], &vote_account(u8::MAX));
+        bank4.store_accounts((bank4.slot(), vote_accounts(4).as_slice()), None);
+        freeze_and_check(&bank4);
+
+        let bank5 = new_bank(&bank4, 5);
+        bank5.store_accounts((bank5.slot(), vote_accounts(5).as_slice()), None);
+        freeze_and_check(&bank5);
     }
 
     /// Ensure freelist respects max size.
