@@ -18,6 +18,10 @@ use {
         kind::{Code as CodeLayout, Data as DataLayout, ShredLayout},
     },
     itertools::Itertools,
+    rayon::{
+        ThreadPool,
+        iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator},
+    },
     reed_solomon_erasure::{
         Error::{InvalidIndex, TooFewShardsPresent},
         galois_8::ReedSolomon,
@@ -45,6 +49,18 @@ static REED_SOLOMON: LazyLock<ReedSolomon> = LazyLock::new(|| {
     ReedSolomon::new(DATA_SHREDS_PER_FEC_BLOCK, CODING_SHREDS_PER_FEC_BLOCK)
         .expect("32:32 must be a valid Reed-Solomon configuration")
 });
+
+/// Minimum size in bytes of the byte-column ranges which [`encode_parity`]
+/// encodes as separate tasks. Each task pays a fixed cost per pair of data and
+/// coding shards, so smaller ranges save little.
+const MIN_ENCODE_RANGE_SIZE: usize = 256;
+
+/// The byte-column ranges which [`encode_parity`] encodes as separate tasks
+/// start at multiples of this size. The SIMD kernels of the Reed-Solomon crate
+/// leave the bytes past the last full vector to a byte-wise loop, which then
+/// runs only at the end of the last range.
+const ENCODE_RANGE_ALIGN: usize = 64;
+const_assert_eq!(MIN_ENCODE_RANGE_SIZE % ENCODE_RANGE_ALIGN, 0);
 
 const_assert_eq!(ShredData::SIZE_OF_PAYLOAD, 1203);
 const_assert_eq!(ShredCode::SIZE_OF_PAYLOAD, 1228);
@@ -815,7 +831,7 @@ pub(super) fn rebuild_erasure_batch(
     shreds: Vec<Shred>,
     must_match_signatures: bool,
 ) -> Result<ErasureBatch, Error> {
-    rebuild_erasure_batch_with_buffer(shreds, must_match_signatures, &mut Vec::new())
+    rebuild_erasure_batch_with_buffer(shreds, must_match_signatures, &mut Vec::new(), None)
 }
 
 /// Rebuilds the whole erasure batch from a subset of its shreds, and verifies
@@ -830,10 +846,13 @@ pub(super) fn rebuild_erasure_batch(
 /// Merkle proofs of received shreds are checked against the rebuilt tree.
 ///
 /// `parity_buffer` is scratch space for the parity check, reused across calls.
+/// With `thread_pool`, the coding shards are encoded in parallel for the parity
+/// check, see [`encode_parity`].
 pub(super) fn rebuild_erasure_batch_with_buffer(
     mut shreds: Vec<Shred>,
     must_match_signatures: bool,
     parity_buffer: &mut Vec<u8>,
+    thread_pool: Option<&ThreadPool>,
 ) -> Result<ErasureBatch, Error> {
     // Sort shreds by their erasure shard index.
     // In particular this places all data shreds before coding shreds.
@@ -892,7 +911,7 @@ pub(super) fn rebuild_erasure_batch_with_buffer(
         .collect::<Result<Vec<_>, Error>>()?;
     let num_received = mask.iter().filter(|&&received| received).count();
     let coding_matches_data = if num_received > DATA_SHREDS_PER_FEC_BLOCK {
-        reconstruct_and_check_parity(&mut shards, parity_buffer)?
+        reconstruct_and_check_parity(&mut shards, parity_buffer, thread_pool)?
     } else {
         // Reconstruction derives the missing shards from exactly
         // DATA_SHREDS_PER_FEC_BLOCK received shards, so the batch is
@@ -970,10 +989,12 @@ pub(super) fn rebuild_erasure_batch_with_buffer(
 /// Reconstruction uses only DATA_SHREDS_PER_FEC_BLOCK of the received shards
 /// and ignores the rest. After recovering the missing data shards, the missing
 /// coding shards are encoded in place, and the received ones into scratch space
-/// which is compared against them.
+/// which is compared against them. With `thread_pool`, the coding shards are
+/// encoded in parallel, see [`encode_parity`].
 fn reconstruct_and_check_parity(
     shards: &mut [(PayloadMutGuard<'_, Range<usize>>, bool)],
     parity_buffer: &mut Vec<u8>,
+    thread_pool: Option<&ThreadPool>,
 ) -> Result<bool, Error> {
     // Most expensive step, its cost grows with the number of missing data shards.
     if shards[..DATA_SHREDS_PER_FEC_BLOCK]
@@ -1009,13 +1030,93 @@ fn reconstruct_and_check_parity(
         })
         .collect();
     // Encode all coding shards, missing ones into shards, received ones into parity_buffer.
-    REED_SOLOMON.encode_sep(&data, &mut parity_shards)?;
+    encode_parity(&data, &mut parity_shards, thread_pool)?;
     drop(parity_shards);
     let received_coding = coding
         .iter()
         .filter(|(_, received)| *received)
         .map(|(shard, _)| shard.as_ref());
     Ok(received_coding.eq(parity_buffer_view.chunks_exact(shard_size)))
+}
+
+/// Encodes the coding shards from the data shards, as `REED_SOLOMON.encode_sep`
+/// does, with the same result.
+///
+/// Reed-Solomon coding computes each byte of a coding shard only from the bytes
+/// at the same offset in the data shards. With `thread_pool`, the shards are
+/// split into ranges of offsets, each at least [`MIN_ENCODE_RANGE_SIZE`] bytes
+/// long, which are encoded in parallel. Without it, for shards too short to
+/// split, and for shards of different sizes, which `encode_sep` rejects,
+/// `encode_sep` runs once over the whole shards on the calling thread.
+fn encode_parity(
+    data: &[&[u8]],
+    parity: &mut [&mut [u8]],
+    thread_pool: Option<&ThreadPool>,
+) -> Result<(), reed_solomon_erasure::Error> {
+    let shard_size = data.first().map(|shard| shard.len()).unwrap_or_default();
+    let num_ranges = thread_pool.map_or(1, |thread_pool| {
+        thread_pool
+            .current_num_threads()
+            .min(shard_size / MIN_ENCODE_RANGE_SIZE)
+    });
+    let same_size = || {
+        let data = data.iter().map(|shard| shard.len());
+        let parity = parity.iter().map(|shard| shard.len());
+        data.chain(parity).all(|size| size == shard_size)
+    };
+    let thread_pool = match thread_pool {
+        Some(thread_pool) if num_ranges > 1 && same_size() => thread_pool,
+        _ => return REED_SOLOMON.encode_sep(data, parity),
+    };
+    let ranges = encode_ranges(shard_size, num_ranges);
+    // Cut each coding shard into the ranges, collecting the pieces by range.
+    let mut pieces: SmallVec<[SmallVec<[&mut [u8]; CODING_SHREDS_PER_FEC_BLOCK]>; 4]> =
+        ranges.iter().map(|_| SmallVec::new()).collect();
+    for shard in parity.iter_mut() {
+        let mut rest = &mut shard[..];
+        for (range, pieces) in ranges.iter().zip(&mut pieces) {
+            let (piece, tail) = rest.split_at_mut(range.len());
+            pieces.push(piece);
+            rest = tail;
+        }
+    }
+    // All pieces of a range have the same nonzero size, so encoding a range
+    // fails only if the number of shards is wrong, with the same error as
+    // encoding the whole shards.
+    thread_pool.install(|| {
+        pieces
+            .as_mut_slice()
+            .par_iter_mut()
+            .zip(ranges.as_slice())
+            .try_for_each(|(parity, range)| {
+                let data: SmallVec<[&[u8]; DATA_SHREDS_PER_FEC_BLOCK]> =
+                    data.iter().map(|shard| &shard[range.clone()]).collect();
+                REED_SOLOMON.encode_sep(&data, parity)
+            })
+    })
+}
+
+/// Splits `0..shard_size` into `num_ranges` consecutive ranges for
+/// [`encode_parity`].
+///
+/// Range boundaries are multiples of [`ENCODE_RANGE_ALIGN`]. The ranges get the
+/// same number of these units, give or take one, and the last range also gets
+/// the bytes past the last unit. With `num_ranges` at most
+/// `shard_size / MIN_ENCODE_RANGE_SIZE`, every range is at least
+/// [`MIN_ENCODE_RANGE_SIZE`] bytes long.
+fn encode_ranges(shard_size: usize, num_ranges: usize) -> SmallVec<[Range<usize>; 4]> {
+    let num_units = shard_size / ENCODE_RANGE_ALIGN;
+    let start = |index: usize| (index * num_units).div_ceil(num_ranges) * ENCODE_RANGE_ALIGN;
+    (0..num_ranges)
+        .map(|index| {
+            let end = if index + 1 == num_ranges {
+                shard_size
+            } else {
+                start(index + 1)
+            };
+            start(index)..end
+        })
+        .collect()
 }
 
 // Compares shreds of the same erasure batch by their erasure shard index
@@ -2177,10 +2278,216 @@ mod test {
                 subset,
                 must_match_signatures,
                 &mut parity_buffer,
+                None,
             )
             .unwrap();
             assert_eq!(rebuilt.check_fec_set(), expected);
         }
+    }
+
+    #[test]
+    fn test_encode_ranges() {
+        for shard_size in 2 * MIN_ENCODE_RANGE_SIZE..=4096 {
+            for num_ranges in 2..=(shard_size / MIN_ENCODE_RANGE_SIZE).min(8) {
+                let ranges = encode_ranges(shard_size, num_ranges);
+                assert_eq!(ranges.len(), num_ranges);
+                assert_eq!(ranges[0].start, 0);
+                assert_eq!(ranges[num_ranges - 1].end, shard_size);
+                for (range, next) in ranges.iter().tuple_windows() {
+                    assert_eq!(range.end, next.start);
+                }
+                for range in &ranges {
+                    assert_eq!(range.start % ENCODE_RANGE_ALIGN, 0, "{ranges:?}");
+                    assert!(range.len() >= MIN_ENCODE_RANGE_SIZE, "{ranges:?}");
+                }
+                let (min, max) = ranges[..num_ranges - 1]
+                    .iter()
+                    .map(|range| range.len())
+                    .minmax()
+                    .into_option()
+                    .unwrap();
+                assert!(max - min <= ENCODE_RANGE_ALIGN, "{ranges:?}");
+                assert!(
+                    ranges[num_ranges - 1].len() < max + 2 * ENCODE_RANGE_ALIGN,
+                    "{ranges:?}"
+                );
+            }
+        }
+    }
+
+    /// Encoding on a thread pool gives the same coding shards, and the same
+    /// errors, as `encode_sep` over the whole shards.
+    #[test]
+    fn test_encode_parity_with_thread_pool() {
+        let mut rng = rand::rng();
+        let thread_pools: Vec<ThreadPool> = [1, 2, 3, 8]
+            .into_iter()
+            .map(|num_threads| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        // Encodes into coding shards of the given sizes, which start out
+        // filled with junk, and returns the result and the coding shards.
+        // Without the outer option, this calls encode_sep directly.
+        fn encode(
+            data: &[Vec<u8>],
+            parity_sizes: &[usize],
+            thread_pool: Option<Option<&ThreadPool>>,
+        ) -> (Result<(), reed_solomon_erasure::Error>, Vec<Vec<u8>>) {
+            let data: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+            let mut parity: Vec<_> = parity_sizes.iter().map(|&size| vec![0xA5; size]).collect();
+            let mut parity_shards: Vec<&mut [u8]> =
+                parity.iter_mut().map(Vec::as_mut_slice).collect();
+            let result = match thread_pool {
+                Some(thread_pool) => encode_parity(&data, &mut parity_shards, thread_pool),
+                None => REED_SOLOMON.encode_sep(&data, &mut parity_shards),
+            };
+            drop(parity_shards);
+            (result, parity)
+        }
+        let check = |data: &[Vec<u8>], parity_sizes: &[usize]| {
+            let expected = encode(data, parity_sizes, None);
+            let thread_pools = once(None).chain(thread_pools.iter().map(Some));
+            for thread_pool in thread_pools {
+                let num_threads = thread_pool.map(ThreadPool::current_num_threads);
+                assert_eq!(
+                    encode(data, parity_sizes, Some(thread_pool)),
+                    expected,
+                    "num_threads: {num_threads:?}, data: {:?}, parity: {parity_sizes:?}",
+                    data.iter().map(Vec::len).collect::<Vec<_>>(),
+                );
+            }
+            expected.0
+        };
+        let make_data = |rng: &mut rand::rngs::ThreadRng, sizes: &[usize]| -> Vec<Vec<u8>> {
+            sizes
+                .iter()
+                .map(|&size| repeat_with(|| rng.random()).take(size).collect())
+                .collect()
+        };
+        for shard_size in [
+            1, 63, 255, 256, 511, 512, 513, 767, 768, 923, 987, 1024, 1139, 2500,
+        ] {
+            let data_sizes = [shard_size; DATA_SHREDS_PER_FEC_BLOCK];
+            let parity_sizes = [shard_size; CODING_SHREDS_PER_FEC_BLOCK];
+            let data = make_data(&mut rng, &data_sizes);
+            assert_eq!(check(&data, &parity_sizes), Ok(()));
+            // A data shard of a different size.
+            let mut sizes = data_sizes;
+            sizes[7] -= 1;
+            let data = make_data(&mut rng, &sizes);
+            assert_eq!(
+                check(&data, &parity_sizes),
+                Err(reed_solomon_erasure::Error::IncorrectShardSize)
+            );
+            // A coding shard of a different size.
+            let data = make_data(&mut rng, &data_sizes);
+            let mut sizes = parity_sizes;
+            sizes[3] += 1;
+            assert_eq!(
+                check(&data, &sizes),
+                Err(reed_solomon_erasure::Error::IncorrectShardSize)
+            );
+            // Coding shards of a different size than the data shards.
+            let sizes = [shard_size + 1; CODING_SHREDS_PER_FEC_BLOCK];
+            assert_eq!(
+                check(&data, &sizes),
+                Err(reed_solomon_erasure::Error::IncorrectShardSize)
+            );
+            // Too few or too many shards.
+            let data = make_data(&mut rng, &[shard_size; DATA_SHREDS_PER_FEC_BLOCK + 1]);
+            assert_eq!(
+                check(&data, &parity_sizes),
+                Err(reed_solomon_erasure::Error::TooManyDataShards)
+            );
+            let data = make_data(&mut rng, &data_sizes);
+            assert_eq!(
+                check(&data, &parity_sizes[1..]),
+                Err(reed_solomon_erasure::Error::TooFewParityShards)
+            );
+        }
+        let data = make_data(&mut rng, &[0; DATA_SHREDS_PER_FEC_BLOCK]);
+        assert_eq!(
+            check(&data, &[0; CODING_SHREDS_PER_FEC_BLOCK]),
+            Err(reed_solomon_erasure::Error::EmptyShard)
+        );
+        assert_eq!(
+            check(&[], &[1024; CODING_SHREDS_PER_FEC_BLOCK]),
+            Err(reed_solomon_erasure::Error::TooFewDataShards)
+        );
+    }
+
+    /// Rebuilding an erasure batch with its coding shards encoded on a thread
+    /// pool gives the same shreds, the same parity check result and the same
+    /// errors as rebuilding it without.
+    #[test_case(false)]
+    #[test_case(true)]
+    fn test_rebuild_erasure_batch_with_thread_pool(resigning: bool) {
+        let mut rng = rand::rng();
+        let keypair = Keypair::new();
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut batches = make_erasure_batches_for_tests(&mut rng, resigning, 0, 0);
+        // Leader-signed erasure batches whose last coding shred, or all coding
+        // shreds, do not match the data shreds.
+        for coding_positions in [
+            CODING_SHREDS_PER_FEC_BLOCK - 1..CODING_SHREDS_PER_FEC_BLOCK,
+            0..CODING_SHREDS_PER_FEC_BLOCK,
+        ] {
+            let mut batch = batches[0].clone();
+            sign_with_invalid_parity_for_tests(&keypair, &mut batch, coding_positions);
+            batches.push(batch);
+        }
+        let mut serial_parity_buffer = Vec::new();
+        let mut pooled_parity_buffer = Vec::new();
+        let mut num_parity_mismatches = 0;
+        let mut num_errors = 0;
+        for batch in &batches {
+            // More than DATA_SHREDS_PER_FEC_BLOCK shreds, so the coding shards
+            // are encoded and checked against the received ones.
+            for size in DATA_SHREDS_PER_FEC_BLOCK + 1..=SHREDS_PER_FEC_BLOCK {
+                let mut subset = batch.clone();
+                subset.shuffle(&mut rng);
+                subset.truncate(size);
+                let must_match_signatures = true;
+                let expected = rebuild_erasure_batch_with_buffer(
+                    subset.clone(),
+                    must_match_signatures,
+                    &mut serial_parity_buffer,
+                    None,
+                );
+                let actual = rebuild_erasure_batch_with_buffer(
+                    subset,
+                    must_match_signatures,
+                    &mut pooled_parity_buffer,
+                    Some(&thread_pool),
+                );
+                match (actual, expected) {
+                    (Ok(actual), Ok(expected)) => {
+                        assert_eq!(actual.shreds, expected.shreds);
+                        assert_eq!(actual.received, expected.received);
+                        assert_eq!(actual.coding_matches_data, expected.coding_matches_data);
+                        assert_eq!(actual.check_fec_set(), expected.check_fec_set());
+                        if !expected.coding_matches_data {
+                            num_parity_mismatches += 1;
+                        }
+                    }
+                    (actual, expected) => {
+                        let expected = expected.err().expect("both rebuilds should fail");
+                        let actual = actual.err().expect("both rebuilds should fail");
+                        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+                        num_errors += 1;
+                    }
+                }
+            }
+        }
+        assert!(num_parity_mismatches > 0);
+        assert!(num_errors > 0);
     }
 
     #[test_case(false)]
