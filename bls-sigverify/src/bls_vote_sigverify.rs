@@ -3,7 +3,7 @@ use {
         bls_sigverifier::SigVerifierChannels,
         bls_vote_sigverify::batch::Batch,
         errors::SigVerifyVoteError,
-        prepared_msg_cache::PreparedMsgCache,
+        prepared_msg_cache::{MAX_PREPARED_MSGS, PreparedMsgCache},
         stats::{SigVerifyVoteStats, VoteSenderStats, VoteVerificationStats},
     },
     agave_votor_messages::wire::VotePayloadToSign,
@@ -27,7 +27,7 @@ pub(crate) mod batch;
 /// Any vote that fails fallback individual signature verification will have its sender banlisted.
 ///
 /// The prepared messages of payloads with at least one valid vote are inserted into
-/// `prepared_msg_cache`.
+/// `prepared_msg_cache`, unless there are more payloads than the cache holds.
 pub(super) fn verify_and_send_votes(
     unverified_votes: &mut HashMap<VotePayloadToSign, Batch>,
     root_bank: &Bank,
@@ -47,13 +47,18 @@ pub(super) fn verify_and_send_votes(
         .distinct_votes_stats
         .add_sample(unverified_votes.len() as u64);
 
+    // The batches keep the new prepared messages for the cache until all of them are verified.
+    // With more batches than the cache holds, they drop them instead, which bounds the memory
+    // that one pass holds for the cache.
+    let keep_prepared_msgs = unverified_votes.len() <= MAX_PREPARED_MSGS;
     let (votes_to_verify, vote_verification_stats) = thread_pool.install(|| {
         unverified_votes
             .par_iter_mut()
             .fold(
                 || (Saturating(0), VoteVerificationStats::default()),
                 |(mut total_votes_to_verify, mut vote_verification_stats), (_, batch)| {
-                    let (votes_to_verify, stats) = batch.verify(ban_sender, thread_pool);
+                    let (votes_to_verify, stats) =
+                        batch.verify(ban_sender, thread_pool, keep_prepared_msgs);
                     total_votes_to_verify += votes_to_verify;
                     vote_verification_stats.merge(stats);
                     (total_votes_to_verify, vote_verification_stats)
