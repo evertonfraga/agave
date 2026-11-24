@@ -4868,13 +4868,6 @@ pub fn populate_blockstore_for_tests(
 ) {
     use crossbeam_channel::bounded;
 
-    let slot = bank.slot();
-    let parent_slot = bank.parent_slot();
-    let shreds =
-        solana_ledger::blockstore::entries_to_test_shreds(&entries, slot, parent_slot, true, 0);
-    blockstore.insert_shreds(shreds, false).unwrap();
-    blockstore.set_roots(std::iter::once(&slot)).unwrap();
-
     let (transaction_status_sender, transaction_status_receiver) = bounded(1024);
     let tss_exit = Arc::new(AtomicBool::new(false));
     let transaction_status_service =
@@ -4882,7 +4875,7 @@ pub fn populate_blockstore_for_tests(
             transaction_status_receiver,
             max_complete_transaction_status_slot,
             Arc::new(AtomicU64::default()),
-            blockstore,
+            blockstore.clone(),
             crate::transaction_status_service::TransactionStatusServiceConfig {
                 enable_rpc_transaction_history: true,
                 ..crate::transaction_status_service::TransactionStatusServiceConfig::default_for_tests()
@@ -4903,6 +4896,32 @@ pub fn populate_blockstore_for_tests(
         None,
     );
 
+    populate_blockstore_with_scheduler_pool_for_tests(entries, bank, &blockstore, &pool);
+
+    transaction_status_service.join().unwrap();
+}
+
+/// Inserts `entries` into `blockstore` as the rooted slot of `bank`, then
+/// executes them on `bank` with a scheduler from `pool`.
+///
+/// Unlike [`populate_blockstore_for_tests`], the caller owns the pool and the
+/// `TransactionStatusService` that receives its transaction statuses, so one
+/// pool and one service can serve many slots, with the service configured as
+/// needed (for example with `enable_extended_tx_metadata_storage`).
+#[cfg(feature = "dev-context-only-utils")]
+pub fn populate_blockstore_with_scheduler_pool_for_tests(
+    entries: Vec<Entry>,
+    bank: Arc<Bank>,
+    blockstore: &Blockstore,
+    pool: &solana_unified_scheduler_pool::DefaultSchedulerPool,
+) {
+    let slot = bank.slot();
+    let parent_slot = bank.parent_slot();
+    let shreds =
+        solana_ledger::blockstore::entries_to_test_shreds(&entries, slot, parent_slot, true, 0);
+    blockstore.insert_shreds(shreds, false).unwrap();
+    blockstore.set_roots(std::iter::once(&slot)).unwrap();
+
     let context = SchedulingContext::new(bank.clone());
     let scheduler = pool.take_scheduler(context).unwrap();
     let bank = BankWithScheduler::new(bank, Some(scheduler));
@@ -4910,8 +4929,6 @@ pub fn populate_blockstore_for_tests(
     // Check that process_entries successfully writes can_commit transactions statuses, and
     // that they are matched properly by get_rooted_block
     solana_ledger::blockstore_processor::process_entries_for_tests(&bank, entries).unwrap();
-
-    transaction_status_service.join().unwrap();
 }
 
 #[cfg(test)]
