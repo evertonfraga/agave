@@ -20,7 +20,8 @@ pub(crate) struct Batch {
     batch_state: BatchState,
     rank_map: Arc<BLSPubkeyToRankMap>,
     /// The prepared message of the payload. Before verification, this is the one the sigverifier
-    /// has cached, if any. After verification, it is set if at least one vote was valid.
+    /// has cached, if any. After verification, it is kept for the cache if at least one vote was
+    /// valid.
     prepared_msg: Option<Arc<PreparedHashedMessage>>,
 }
 
@@ -54,11 +55,14 @@ impl Batch {
         self.batch_state.push(payload, sender_vote_account_pubkey)
     }
 
+    /// Verifies the votes of the batch. If `keep_prepared_msg` is set and at least one vote is
+    /// valid, keeps the prepared message of the payload for the cache.
     #[must_use]
     pub(super) fn verify(
         &mut self,
         ban_sender: &BanSender,
         thread_pool: &ThreadPool,
+        keep_prepared_msg: bool,
     ) -> (usize, VoteVerificationStats) {
         let (num_votes_to_sigverify, stats, prepared_msg) = self.batch_state.verify(
             self.rank_map.len(),
@@ -66,12 +70,11 @@ impl Batch {
             ban_sender,
             thread_pool,
         );
-        self.prepared_msg = prepared_msg;
+        self.prepared_msg = prepared_msg.filter(|_| keep_prepared_msg);
         (num_votes_to_sigverify, stats)
     }
 
-    /// Takes the prepared message of the payload. After [`Self::verify`], it is set if at least
-    /// one vote was valid.
+    /// Takes the prepared message of the payload that [`Self::verify`] kept for the cache.
     pub(super) fn take_prepared_msg(&mut self) -> Option<Arc<PreparedHashedMessage>> {
         self.prepared_msg.take()
     }

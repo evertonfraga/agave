@@ -1501,6 +1501,35 @@ fn test_votes_for_one_payload_across_passes() {
 }
 
 #[test]
+fn test_votes_for_more_payloads_than_the_cache_holds() {
+    let ctx = TestContext::new();
+    let shred_version = ctx.cluster_info.my_shred_version();
+    // More distinct payloads than the 256 that the sigverifier caches prepared messages for,
+    // which it verifies without caching them when they arrive in one pass.
+    let num_slots = 30;
+    let mut expected = Vec::new();
+    let mut messages = Vec::new();
+    for slot in 1..=num_slots {
+        for (rank, keypair) in ctx.validator_keypairs.iter().enumerate() {
+            let vote = Vote::new_unique_notar(slot);
+            let message = ConsensusMessage::Vote(create_signed_vote_message(
+                &ctx.sharable_banks.root(),
+                &ctx.validator_keypairs,
+                shred_version,
+                vote,
+                rank,
+            ));
+            messages.push((message, keypair.node_keypair.pubkey()));
+            expected.push((vote, rank));
+        }
+    }
+    assert!(expected.len() > 256);
+    ctx.send_datagrams(messages_to_datagrams(&messages, shred_version));
+    let (aggregates, _) = receive_messages(&ctx.pool_receiver, expected.len(), 0);
+    assert_verified_votes(&aggregates, &expected);
+}
+
+#[test]
 fn test_banlist_updates_for_invalid_certificates() {
     let mut ctx = TestContext::new();
 
