@@ -5,7 +5,7 @@ use {
         shred::{
             CODING_SHREDS_PER_FEC_BLOCK, DATA_SHREDS_PER_FEC_BLOCK, MAX_DATA_SHREDS_PER_SLOT,
             ShredFlags,
-            filter::new_dummy_retransmit_sender,
+            filter::{RetransmitSender, ShredBatch, new_dummy_retransmit_sender},
             max_ticks_per_n_shreds,
             merkle::{
                 finish_erasure_batch_for_tests, sign_with_duplicate_coding_index_for_tests,
@@ -16,6 +16,7 @@ use {
     },
     agave_shred_wire_format::constants::SIZE_OF_MERKLE_PROOF_ENTRY,
     agave_votor_messages::consensus_message::BlockId,
+    agave_worker_pool::{WorkerPool, WorkerPoolConfig},
     rand::{Rng, rng, seq::SliceRandom},
     rand_chacha::{ChaChaRng, rand_core::SeedableRng},
     solana_entry::entry::{
@@ -5625,6 +5626,218 @@ fn test_fec_set_rebuild_failure_invalid_parity() {
         );
     }
     verify_index_integrity(&blockstore, slot);
+}
+
+/// Rebuilding the erasure batches of an insert call on a thread pool stores
+/// the same shreds as rebuilding them one at a time on the inserting thread,
+/// sends the same recovered shreds for retransmit in the same order, marks the
+/// same slots dead and counts the same metrics. The second insert call brings
+/// several erasure sets to the rebuild threshold at once, including some with
+/// shreds read back from blockstore and some which fail to rebuild or fail the
+/// SIMD-0504 checks. The test genesis activates all features at slot 0, which
+/// are effective from epoch 1 on.
+#[test_case(1, false; "before activation")]
+#[test_case(100, true; "after activation")]
+fn test_shred_recovery_with_thread_pool(first_slot: Slot, gate_active: bool) {
+    let mut rng = ChaChaRng::seed_from_u64(first_slot);
+    let erasure_batches = |shreds: Vec<Shred>| {
+        let mut batches = BTreeMap::<u32, Vec<Shred>>::new();
+        for shred in shreds {
+            batches
+                .entry(shred.fec_set_index())
+                .or_default()
+                .push(shred);
+        }
+        batches
+    };
+    // Picks `num_data` data and `num_coding` coding shreds of the erasure
+    // batch at random.
+    let pick = |rng: &mut ChaChaRng, batch: &[Shred], num_data: usize, num_coding: usize| {
+        let (mut data, mut code): (Vec<_>, Vec<_>) =
+            batch.iter().cloned().partition(Shred::is_data);
+        data.shuffle(rng);
+        code.shuffle(rng);
+        data.truncate(num_data);
+        code.truncate(num_coding);
+        [data, code].concat()
+    };
+    let mut first_call = Vec::new();
+    let mut second_call = Vec::new();
+    let mut num_valid_erasure_sets = 0;
+
+    // Valid erasure sets with data and coding shreds missing, with data shreds
+    // only, with exactly DATA_SHREDS_PER_FEC_BLOCK shreds, and complete.
+    let (data_shreds, coding_shreds) = setup_erasure_shreds(first_slot, 0, 500);
+    let batches = erasure_batches([data_shreds, coding_shreds].concat());
+    assert!(batches.len() >= 4, "expected at least 4 erasure sets");
+    for (i, batch) in batches.values().enumerate() {
+        let (num_data, num_coding) = match i % 4 {
+            0 => (
+                DATA_SHREDS_PER_FEC_BLOCK - 2,
+                CODING_SHREDS_PER_FEC_BLOCK - 2,
+            ),
+            1 => (DATA_SHREDS_PER_FEC_BLOCK, 0),
+            2 => (
+                DATA_SHREDS_PER_FEC_BLOCK / 2,
+                CODING_SHREDS_PER_FEC_BLOCK / 2,
+            ),
+            _ => (DATA_SHREDS_PER_FEC_BLOCK, CODING_SHREDS_PER_FEC_BLOCK),
+        };
+        second_call.extend(pick(&mut rng, batch, num_data, num_coding));
+        num_valid_erasure_sets += 1;
+    }
+
+    // Valid erasure sets whose first shreds are inserted in an earlier call
+    // and read back from blockstore for recovery.
+    let (data_shreds, coding_shreds) = setup_erasure_shreds(first_slot + 1, 0, 200);
+    for batch in erasure_batches([data_shreds, coding_shreds].concat()).values() {
+        let mut shreds = pick(
+            &mut rng,
+            batch,
+            DATA_SHREDS_PER_FEC_BLOCK - 3,
+            CODING_SHREDS_PER_FEC_BLOCK - 3,
+        );
+        shreds.shuffle(&mut rng);
+        second_call.extend(shreds.split_off(DATA_SHREDS_PER_FEC_BLOCK / 2));
+        first_call.extend(shreds);
+        num_valid_erasure_sets += 1;
+    }
+
+    // Leader-signed erasure sets whose coding shreds do not match the data
+    // shreds. With all coding shreds invalid, the data shred recovered from
+    // the first coding shred does not match the signed Merkle root, so the
+    // erasure batch fails to rebuild. With only the last coding shred invalid,
+    // the erasure batch rebuilds but fails the parity check.
+    for (slot, invalid_coding_positions) in [
+        (first_slot + 2, 0..CODING_SHREDS_PER_FEC_BLOCK),
+        (
+            first_slot + 3,
+            CODING_SHREDS_PER_FEC_BLOCK - 1..CODING_SHREDS_PER_FEC_BLOCK,
+        ),
+    ] {
+        let (data_shreds, coding_shreds) = setup_erasure_shreds(slot, 0, 100);
+        let mut batch = erasure_batches([data_shreds, coding_shreds].concat())
+            .remove(&0)
+            .unwrap();
+        sign_with_invalid_parity_for_tests(&Keypair::new(), &mut batch, invalid_coding_positions);
+        let code = batch.split_off(DATA_SHREDS_PER_FEC_BLOCK);
+        let mut data = batch;
+        data.pop();
+        second_call.extend(data);
+        second_call.extend([
+            code[0].clone(),
+            code[CODING_SHREDS_PER_FEC_BLOCK - 1].clone(),
+        ]);
+    }
+
+    // Collects the shreds sent for retransmit. A single worker keeps the order
+    // of the jobs, and the queue has room for all of them.
+    let new_retransmit_sender = |retransmitted: Arc<Mutex<Vec<Payload>>>| -> RetransmitSender {
+        let config = WorkerPoolConfig {
+            job_queue_capacity: NonZeroUsize::new(1024).unwrap(),
+            ..WorkerPoolConfig::new("solTestRetrans", NonZeroUsize::MIN)
+        };
+        let make_job_handler = move |_worker_id: usize| {
+            let retransmitted = retransmitted.clone();
+            move |shreds: ShredBatch| retransmitted.lock().unwrap().extend(shreds)
+        };
+        Arc::new(WorkerPool::spawn(config, make_job_handler).unwrap())
+    };
+    let new_blockstore = |ledger_path: &Path, thread_pool: Option<Arc<rayon::ThreadPool>>| {
+        let genesis_config = create_genesis_config(2).genesis_config;
+        let root_bank = Arc::new(Bank::new_for_tests(&genesis_config));
+        let retransmitted = Arc::new(Mutex::new(Vec::new()));
+        let shred_version = 0;
+        let mut shred_recovery_context = ShredRecoveryContext::new(
+            new_retransmit_sender(retransmitted.clone()),
+            root_bank,
+            shred_version,
+        );
+        if let Some(thread_pool) = thread_pool {
+            shred_recovery_context = shred_recovery_context.with_thread_pool(thread_pool);
+        }
+        let blockstore = RecoveryTestBlockstore {
+            blockstore: Blockstore::open(ledger_path).unwrap(),
+            shred_recovery_context,
+        };
+        (blockstore, retransmitted)
+    };
+    let serial_ledger_path = get_tmp_ledger_path_auto_delete!();
+    let (mut serial, serial_retransmitted) = new_blockstore(serial_ledger_path.path(), None);
+    let thread_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .thread_name(|i| format!("solTestRecov{i:02}"))
+        .build()
+        .unwrap();
+    let pooled_ledger_path = get_tmp_ledger_path_auto_delete!();
+    let (mut pooled, pooled_retransmitted) =
+        new_blockstore(pooled_ledger_path.path(), Some(Arc::new(thread_pool)));
+
+    let recovery_metrics = |metrics: &BlockstoreInsertionMetrics| {
+        (
+            metrics.num_inserted,
+            metrics.num_recovered_data_shreds,
+            metrics.num_recovered_coding_shreds,
+            metrics.num_recovered_retransmit_batches,
+            metrics.num_recovered_inserted,
+            metrics.num_recovered_failed_invalid,
+            metrics.num_recovered_exists,
+            metrics.num_fec_set_checks_passed,
+            metrics.num_fec_set_checks_failed,
+            metrics.num_fec_set_checks_rebuild_failed,
+        )
+    };
+    let original = BlockLocation::Original;
+    let expected = serial.insert(first_call.clone(), original);
+    let actual = pooled.insert(first_call, original);
+    assert_eq!(recovery_metrics(&actual), recovery_metrics(&expected));
+    assert_eq!(expected.num_fec_set_checks_passed, 0);
+
+    let expected = serial.insert(second_call.clone(), original);
+    let actual = pooled.insert(second_call, original);
+    assert_eq!(recovery_metrics(&actual), recovery_metrics(&expected));
+    assert_eq!(expected.num_fec_set_checks_passed, num_valid_erasure_sets);
+    assert_eq!(expected.num_fec_set_checks_failed, 2);
+    assert_eq!(expected.num_fec_set_checks_rebuild_failed, 1);
+    assert!(expected.num_recovered_data_shreds > 0);
+    assert!(expected.num_recovered_coding_shreds > 0);
+    assert!(!serial.is_dead(first_slot));
+    assert!(!serial.is_dead(first_slot + 1));
+    assert_eq!(serial.is_dead(first_slot + 2), gate_active);
+    assert_eq!(serial.is_dead(first_slot + 3), gate_active);
+
+    for slot in first_slot..first_slot + 4 {
+        assert_eq!(pooled.is_dead(slot), serial.is_dead(slot), "slot {slot}");
+        let meta = |blockstore: &Blockstore| {
+            blockstore.meta(slot).unwrap().map(|meta| SlotMeta {
+                // Taken from the clock when the first shred is inserted.
+                first_shred_timestamp: 0,
+                ..meta
+            })
+        };
+        assert_eq!(meta(&pooled), meta(&serial), "slot {slot}");
+        let data_shreds = |blockstore: &Blockstore| -> Vec<_> {
+            blockstore.slot_data_iterator(slot, 0).unwrap().collect()
+        };
+        assert_eq!(data_shreds(&pooled), data_shreds(&serial), "slot {slot}");
+        let coding_shreds = |blockstore: &Blockstore| -> Vec<_> {
+            blockstore.slot_coding_iterator(slot, 0).unwrap().collect()
+        };
+        assert_eq!(
+            coding_shreds(&pooled),
+            coding_shreds(&serial),
+            "slot {slot}"
+        );
+        verify_index_integrity(&pooled, slot);
+    }
+
+    // Dropping the blockstores drops the retransmit senders, which waits for
+    // the queued jobs.
+    drop(serial);
+    drop(pooled);
+    let expected = serial_retransmitted.lock().unwrap();
+    assert!(!expected.is_empty());
+    assert_eq!(*pooled_retransmitted.lock().unwrap(), *expected);
 }
 
 /// The erasure set has `num_data` data and `num_coding` coding shreds in the

@@ -11,6 +11,10 @@ use {
     agave_feature_set as feature_set,
     agave_worker_pool::WorkerPool,
     itertools::Itertools,
+    rayon::{
+        ThreadPool,
+        iter::{IntoParallelIterator, ParallelIterator},
+    },
     solana_clock::Slot,
     solana_epoch_schedule::EpochSchedule,
     solana_perf::packet::BytesPacket,
@@ -544,6 +548,10 @@ pub struct ShredRecoveryContext {
     /// Scratch space for the parity check of erasure batches, reused across
     /// recoveries.
     parity_buffer: Vec<u8>,
+    /// Thread pool to rebuild the erasure batches of one insert call in
+    /// parallel. Without it, erasure batches are rebuilt one at a time on the
+    /// inserting thread.
+    thread_pool: Option<Arc<ThreadPool>>,
 }
 
 /// Maximum number of shreds sent to retransmit workers in one job.
@@ -577,7 +585,23 @@ impl ShredRecoveryContext {
             retransmit_sender,
             shred_filter_ctx,
             parity_buffer: Vec::new(),
+            thread_pool: None,
         }
+    }
+
+    /// Rebuilds the erasure batches of an insert call in parallel on
+    /// `thread_pool`, when there is more than one.
+    ///
+    /// Recovery holds the blockstore insert lock, so other jobs on the pool
+    /// must not insert shreds into the same blockstore.
+    pub fn with_thread_pool(mut self, thread_pool: Arc<ThreadPool>) -> Self {
+        self.thread_pool = Some(thread_pool);
+        self
+    }
+
+    /// Returns true if erasure batches are rebuilt on a thread pool.
+    pub(crate) fn has_thread_pool(&self) -> bool {
+        self.thread_pool.is_some()
     }
 
     /// Periodically (no more than once per slot) update the context used for filtering
@@ -635,6 +659,65 @@ impl ShredRecoveryContext {
         &mut self,
         shreds: T,
     ) -> Result<ErasureBatch, Error> {
+        let (shreds, must_match_signatures) = self.filter_shreds_for_rebuild(shreds);
+        merkle::rebuild_erasure_batch_with_buffer(
+            shreds,
+            must_match_signatures,
+            &mut self.parity_buffer,
+        )
+    }
+
+    /// Rebuilds several erasure batches as [`Self::rebuild_erasure_batch`]
+    /// does, and returns the results in the same order.
+    ///
+    /// The shreds are filtered on the calling thread, in order. With a thread
+    /// pool, the erasure batches are then rebuilt in parallel, and each task
+    /// uses its own scratch space for the parity check.
+    pub(crate) fn rebuild_erasure_batches<T: IntoIterator<Item = Shred>>(
+        &mut self,
+        batches: impl IntoIterator<Item = T>,
+    ) -> Vec<Result<ErasureBatch, Error>> {
+        let batches: Vec<_> = batches
+            .into_iter()
+            .map(|shreds| self.filter_shreds_for_rebuild(shreds))
+            .collect();
+        match &self.thread_pool {
+            Some(thread_pool) => thread_pool.install(|| {
+                batches
+                    .into_par_iter()
+                    .map_init(
+                        Vec::new,
+                        |parity_buffer, (shreds, must_match_signatures)| {
+                            merkle::rebuild_erasure_batch_with_buffer(
+                                shreds,
+                                must_match_signatures,
+                                parity_buffer,
+                            )
+                        },
+                    )
+                    .collect()
+            }),
+            None => batches
+                .into_iter()
+                .map(|(shreds, must_match_signatures)| {
+                    merkle::rebuild_erasure_batch_with_buffer(
+                        shreds,
+                        must_match_signatures,
+                        &mut self.parity_buffer,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Applies filtering to the shreds of an erasure batch to be rebuilt.
+    ///
+    /// Returns the shreds which pass, and whether they must all carry the
+    /// same signature.
+    fn filter_shreds_for_rebuild<T: IntoIterator<Item = Shred>>(
+        &mut self,
+        shreds: T,
+    ) -> (Vec<Shred>, /*must_match_signatures:*/ bool) {
         let shreds: Vec<_> = shreds
             .into_iter()
             .filter(|shred| !self.shred_filter_ctx.should_discard_shred(shred.payload()))
@@ -642,12 +725,7 @@ impl ShredRecoveryContext {
         let must_match_signatures = !shreds
             .first()
             .is_some_and(|shred| self.is_stricter_shred_validation_active(shred.slot()));
-
-        merkle::rebuild_erasure_batch_with_buffer(
-            shreds,
-            must_match_signatures,
-            &mut self.parity_buffer,
-        )
+        (shreds, must_match_signatures)
     }
 
     /// Checks the reconstructed shreds of the erasure batch.
