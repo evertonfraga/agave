@@ -619,18 +619,23 @@ impl JsonRpcRequestProcessor {
         })?;
         let encoding = encoding.unwrap_or(UiAccountEncoding::Base64);
 
-        let mut accounts = Vec::with_capacity(pubkeys.len());
-        for pubkey in pubkeys {
-            let bank = Arc::clone(&bank);
-            accounts.push(
-                self.runtime
-                    .spawn_blocking(move || {
-                        get_encoded_account(&bank, &pubkey, encoding, data_slice, None)
-                    })
-                    .await
-                    .expect("rpc: get_encoded_account panicked")?,
-            );
-        }
+        // Load and encode all accounts in one blocking task, so that the request waits
+        // for a blocking thread once rather than once per account.
+        let accounts = self
+            .runtime
+            .spawn_blocking({
+                let bank = Arc::clone(&bank);
+                move || {
+                    pubkeys
+                        .iter()
+                        .map(|pubkey| {
+                            get_encoded_account(&bank, pubkey, encoding, data_slice, None)
+                        })
+                        .collect::<Result<Vec<_>>>()
+                }
+            })
+            .await
+            .expect("rpc: get_encoded_account panicked")?;
         Ok(new_response(&bank, accounts))
     }
 
@@ -6869,6 +6874,229 @@ pub mod tests {
             result.value, expected,
             "should use data slice if parsing fails"
         );
+    }
+
+    /// Sends getMultipleAccounts for `pubkeys` with `config` and returns the response value.
+    fn get_multiple_accounts_value(rpc: &RpcHandler, pubkeys: &[Pubkey], config: Value) -> Value {
+        let addresses: Vec<_> = pubkeys.iter().map(|pubkey| pubkey.to_string()).collect();
+        let request = create_test_request("getMultipleAccounts", Some(json!([addresses, config])));
+        let result: RpcResponse<Value> = parse_success_result(rpc.handle_request_sync(request));
+        result.value
+    }
+
+    /// Returns the getMultipleAccounts response value for `pubkeys`, built by loading and
+    /// encoding the accounts one at a time.
+    fn get_encoded_accounts_one_at_a_time(
+        bank: &Bank,
+        pubkeys: &[Pubkey],
+        encoding: UiAccountEncoding,
+        data_slice: Option<UiDataSliceConfig>,
+    ) -> Value {
+        let accounts: Vec<_> = pubkeys
+            .iter()
+            .map(|pubkey| get_encoded_account(bank, pubkey, encoding, data_slice, None).unwrap())
+            .collect();
+        json!(accounts)
+    }
+
+    #[test]
+    fn test_rpc_get_multiple_accounts_number_of_accounts() {
+        let rpc = RpcHandler::start();
+        let bank = rpc.working_bank();
+
+        // Each account has its own lamports and data length, so that a response with the
+        // accounts in another order does not match.
+        let pubkeys: Vec<_> = (0..MAX_MULTIPLE_ACCOUNTS)
+            .map(|i| {
+                let pubkey = Pubkey::new_unique();
+                let account = AccountSharedData::new_with_data(
+                    i as u64 + 1,
+                    vec![i as u8; i],
+                    &Pubkey::default(),
+                );
+                bank.store_account(&pubkey, &account);
+                pubkey
+            })
+            .collect();
+
+        assert_eq!(
+            get_multiple_accounts_value(&rpc, &[], Value::Null),
+            json!([])
+        );
+        for num_accounts in [1, 2, 15, 16, 17, 32, 33, MAX_MULTIPLE_ACCOUNTS] {
+            let pubkeys = &pubkeys[..num_accounts];
+            let expected =
+                get_encoded_accounts_one_at_a_time(&bank, pubkeys, UiAccountEncoding::Base64, None);
+            assert_eq!(expected.as_array().unwrap().len(), num_accounts);
+            assert_eq!(
+                get_multiple_accounts_value(&rpc, pubkeys, Value::Null),
+                expected,
+                "{num_accounts} accounts"
+            );
+        }
+        let data_slice = UiDataSliceConfig {
+            offset: 1,
+            length: 2,
+        };
+        assert_eq!(
+            get_multiple_accounts_value(
+                &rpc,
+                &pubkeys,
+                json!({"encoding": "base58", "dataSlice": data_slice}),
+            ),
+            get_encoded_accounts_one_at_a_time(
+                &bank,
+                &pubkeys,
+                UiAccountEncoding::Base58,
+                Some(data_slice),
+            ),
+        );
+
+        // One more than the maximum is rejected.
+        let mut addresses: Vec<_> = pubkeys.iter().map(|pubkey| pubkey.to_string()).collect();
+        addresses.push(Pubkey::new_unique().to_string());
+        let request = create_test_request("getMultipleAccounts", Some(json!([addresses])));
+        let (code, message) = parse_failure_response(rpc.handle_request_sync(request));
+        assert_eq!(code, ErrorCode::InvalidParams.code());
+        assert_eq!(
+            message,
+            format!("Too many inputs provided; max {MAX_MULTIPLE_ACCOUNTS}")
+        );
+    }
+
+    #[test]
+    fn test_rpc_get_multiple_accounts_duplicate_and_missing() {
+        let rpc = RpcHandler::start();
+        let bank = rpc.working_bank();
+
+        let pubkey = Pubkey::new_unique();
+        let data = vec![1, 2, 3];
+        let account = AccountSharedData::new_with_data(42, data.clone(), &Pubkey::default());
+        bank.store_account(&pubkey, &account);
+        let expected_account = json!({
+            "owner": "11111111111111111111111111111111",
+            "lamports": 42,
+            "data": [BASE64_STANDARD.encode(&data), "base64"],
+            "executable": false,
+            "rentEpoch": u64::MAX,
+            "space": 3,
+        });
+        let missing_pubkey = Pubkey::new_unique();
+        let other_missing_pubkey = Pubkey::new_unique();
+
+        assert_eq!(
+            get_multiple_accounts_value(&rpc, &[missing_pubkey], Value::Null),
+            json!([null])
+        );
+        assert_eq!(
+            get_multiple_accounts_value(&rpc, &[pubkey, pubkey], Value::Null),
+            json!([expected_account, expected_account])
+        );
+        assert_eq!(
+            get_multiple_accounts_value(
+                &rpc,
+                &[missing_pubkey; MAX_MULTIPLE_ACCOUNTS],
+                Value::Null
+            ),
+            Value::Array(vec![Value::Null; MAX_MULTIPLE_ACCOUNTS])
+        );
+        assert_eq!(
+            get_multiple_accounts_value(&rpc, &[pubkey; MAX_MULTIPLE_ACCOUNTS], Value::Null),
+            Value::Array(vec![expected_account.clone(); MAX_MULTIPLE_ACCOUNTS])
+        );
+
+        // Duplicate and missing accounts mixed with others, all through the request.
+        let others: Vec<_> = (0..MAX_MULTIPLE_ACCOUNTS)
+            .map(|i| {
+                let pubkey = Pubkey::new_unique();
+                let account =
+                    AccountSharedData::new_with_data(i as u64 + 1, vec![0; i], &Pubkey::default());
+                bank.store_account(&pubkey, &account);
+                pubkey
+            })
+            .collect();
+        let pubkeys: Vec<_> = (0..MAX_MULTIPLE_ACCOUNTS)
+            .map(|i| match i % 4 {
+                0 => missing_pubkey,
+                1 => pubkey,
+                2 => other_missing_pubkey,
+                _ => others[i],
+            })
+            .collect();
+        let value = get_multiple_accounts_value(&rpc, &pubkeys, Value::Null);
+        assert_eq!(
+            value,
+            get_encoded_accounts_one_at_a_time(&bank, &pubkeys, UiAccountEncoding::Base64, None)
+        );
+        for (i, account) in value.as_array().unwrap().iter().enumerate() {
+            match i % 4 {
+                0 | 2 => assert!(account.is_null(), "account {i}"),
+                1 => assert_eq!(account, &expected_account, "account {i}"),
+                _ => assert_eq!(account["lamports"], i + 1, "account {i}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rpc_get_multiple_accounts_error() {
+        let rpc = RpcHandler::start();
+        let bank = rpc.working_bank();
+
+        let small_pubkey = Pubkey::new_unique();
+        let small_account =
+            AccountSharedData::new_with_data(42, vec![0; MAX_BASE58_BYTES], &Pubkey::default());
+        bank.store_account(&small_pubkey, &small_account);
+        let large_pubkey = Pubkey::new_unique();
+        let large_account =
+            AccountSharedData::new_with_data(42, vec![0; MAX_BASE58_BYTES + 1], &Pubkey::default());
+        bank.store_account(&large_pubkey, &large_account);
+        let missing_pubkey = Pubkey::new_unique();
+
+        // An account that is too large for base58 fails the whole request, wherever it is.
+        for position in [0, 1, 15, 16, 17, MAX_MULTIPLE_ACCOUNTS - 1] {
+            let mut pubkeys = vec![small_pubkey; MAX_MULTIPLE_ACCOUNTS];
+            pubkeys[1] = missing_pubkey;
+            pubkeys[position] = large_pubkey;
+            for encoding in ["base58", "binary"] {
+                let addresses: Vec<_> = pubkeys.iter().map(|pubkey| pubkey.to_string()).collect();
+                let request = create_test_request(
+                    "getMultipleAccounts",
+                    Some(json!([addresses, {"encoding": encoding}])),
+                );
+                let (code, message) = parse_failure_response(rpc.handle_request_sync(request));
+                assert_eq!(
+                    code,
+                    ErrorCode::InvalidRequest.code(),
+                    "{encoding} {position}"
+                );
+                assert_eq!(
+                    message,
+                    format!(
+                        "Encoded binary (base 58) data should be less than {MAX_BASE58_BYTES} \
+                         bytes, please use Base64 encoding."
+                    ),
+                    "{encoding} {position}"
+                );
+            }
+
+            // The same accounts succeed with a data slice that fits.
+            assert_eq!(
+                get_multiple_accounts_value(
+                    &rpc,
+                    &pubkeys,
+                    json!({"encoding": "base58", "dataSlice": {"offset": 1, "length": 10}}),
+                ),
+                get_encoded_accounts_one_at_a_time(
+                    &bank,
+                    &pubkeys,
+                    UiAccountEncoding::Base58,
+                    Some(UiDataSliceConfig {
+                        offset: 1,
+                        length: 10,
+                    }),
+                ),
+            );
+        }
     }
 
     #[test]
