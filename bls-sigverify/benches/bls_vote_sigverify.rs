@@ -13,9 +13,7 @@ use {
     },
     criterion::{BatchSize, Criterion, criterion_group, criterion_main},
     rayon::{ThreadPool, ThreadPoolBuilder},
-    solana_bls_signatures::{
-        HashedMessage, Keypair as BLSKeypair, PreparedHashedMessage, VerifySignature,
-    },
+    solana_bls_signatures::{Keypair as BLSKeypair, PreparedHashedMessage, VerifySignature},
     solana_genesis_config::GenesisConfig,
     solana_keypair::Keypair,
     solana_pubkey::Pubkey,
@@ -136,21 +134,21 @@ fn bench_verify_individual_votes(c: &mut Criterion) {
                         .unwrap()
                         .bls_pubkey_to_rank_map();
                     let serialized_vote = wincode::serialize(&vote_payload_to_sign).unwrap();
-                    let hashed_msg = HashedMessage::new(&serialized_vote);
+                    let prepared_msg = PreparedHashedMessage::new(&serialized_vote);
                     (
                         unverified_votes.clone(),
                         sender_vote_account_pubkeys.clone(),
-                        hashed_msg,
+                        prepared_msg,
                         rank_map.len(),
                     )
                 },
-                |(votes, sender_vote_account_pubkeys, hashed_msg, max_validators)| {
+                |(votes, sender_vote_account_pubkeys, prepared_msg, max_validators)| {
                     let res = verify_individual_votes(
                         Vote::from(vote_payload_to_sign),
                         max_validators,
                         black_box(&votes),
                         black_box(sender_vote_account_pubkeys),
-                        black_box(&hashed_msg),
+                        black_box(&prepared_msg),
                         &thread_pool,
                     );
                     black_box(res);

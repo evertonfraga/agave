@@ -9,6 +9,7 @@ use {
         errors::SigVerifyError,
         generated_cert_types::GeneratedCertTypes,
         metric_types::ConsensusMetricsEventSender,
+        prepared_msg_cache::PreparedMsgCache,
         pubkeys::VerifiedVotorSlotsMessage,
         rank_map_cache::RankMapCache,
         rewards::{RewardInput, rewards_wants_vote},
@@ -154,6 +155,8 @@ struct SigVerifier {
     generated_cert_types: Arc<GeneratedCertTypes>,
     vote_pool: VotePool,
     rank_map_cache: RankMapCache,
+    /// Prepared messages of recent vote payloads, to skip hashing them in later passes.
+    prepared_msg_cache: PreparedMsgCache,
 }
 
 impl SigVerifier {
@@ -187,6 +190,7 @@ impl SigVerifier {
             thread_pool,
             generated_cert_types,
             rank_map_cache: RankMapCache::default(),
+            prepared_msg_cache: PreparedMsgCache::default(),
         }
     }
 
@@ -275,6 +279,7 @@ impl SigVerifier {
                     &self.ban_sender,
                     &self.thread_pool,
                     &self.channels,
+                    &mut self.prepared_msg_cache,
                 )
             },
             || {
@@ -305,6 +310,7 @@ impl SigVerifier {
             self.last_checked_root_slot = root_slot;
             self.verified_certs.retain(|cert| cert.slot() >= root_slot);
             self.vote_pool.prune(root_slot);
+            self.prepared_msg_cache.prune(root_slot);
         }
         self.rank_map_cache.purge(root_epoch);
     }
@@ -476,11 +482,18 @@ impl SigVerifier {
                 };
                 match self.keep_vote(&rank_map, unverified_vote, sender_identity_pubkey) {
                     Some((payload, sender_vote_account_pubkey)) => {
+                        let prepared_msg = self.prepared_msg_cache.get(&vote_payload_to_sign);
+                        if prepared_msg.is_some() {
+                            self.stats.prepared_msg_cache_hits += 1;
+                        } else {
+                            self.stats.prepared_msg_cache_misses += 1;
+                        }
                         let batch = Batch::new(
                             vote_payload_to_sign,
                             payload,
                             sender_vote_account_pubkey,
                             rank_map,
+                            prepared_msg,
                         );
                         e.insert(batch);
                     }

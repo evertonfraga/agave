@@ -22,6 +22,7 @@ use {
 };
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) struct VerifiedBatch {
     vote: Vote,
     aggregates: Vec<VoteAggregate>,
