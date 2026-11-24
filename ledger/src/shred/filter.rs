@@ -549,6 +549,7 @@ pub struct ShredRecoveryContext {
     /// recoveries.
     parity_buffer: Vec<u8>,
     /// Thread pool to rebuild the erasure batches of one insert call in
+    /// parallel, and to re-encode the coding shards of each erasure batch in
     /// parallel. Without it, erasure batches are rebuilt one at a time on the
     /// inserting thread.
     thread_pool: Option<Arc<ThreadPool>>,
@@ -590,7 +591,9 @@ impl ShredRecoveryContext {
     }
 
     /// Rebuilds the erasure batches of an insert call in parallel on
-    /// `thread_pool`, when there is more than one.
+    /// `thread_pool`, when there is more than one. Also re-encodes the coding
+    /// shards of an erasure batch in parallel on it, when the erasure batch is
+    /// rebuilt from more than `DATA_SHREDS_PER_FEC_BLOCK` shreds.
     ///
     /// Recovery holds the blockstore insert lock, so other jobs on the pool
     /// must not insert shreds into the same blockstore.
@@ -664,6 +667,7 @@ impl ShredRecoveryContext {
             shreds,
             must_match_signatures,
             &mut self.parity_buffer,
+            self.thread_pool.as_deref(),
         )
     }
 
@@ -692,6 +696,7 @@ impl ShredRecoveryContext {
                                 shreds,
                                 must_match_signatures,
                                 parity_buffer,
+                                Some(thread_pool.as_ref()),
                             )
                         },
                     )
@@ -704,6 +709,7 @@ impl ShredRecoveryContext {
                         shreds,
                         must_match_signatures,
                         &mut self.parity_buffer,
+                        None,
                     )
                 })
                 .collect(),
@@ -1156,6 +1162,47 @@ mod tests {
             result.is_ok(),
             "mixed signatures over the same Merkle root should rebuild once SIMD-0504 is active"
         );
+    }
+
+    /// A recovery context with a thread pool rebuilds an erasure batch as one
+    /// without does.
+    #[test]
+    fn test_rebuild_erasure_batch_with_thread_pool() {
+        let mut rng = rand::rng();
+        let slot = 200;
+        let data_size = 1200 * 5;
+        let is_last_in_slot = true;
+        let shreds =
+            make_merkle_shreds_for_tests(&mut rng, slot, data_size, is_last_in_slot).unwrap();
+        let shred_version = shreds[0].common_header().version;
+        let (data_shreds, coding_shreds): (Vec<_>, Vec<_>) = shreds
+            .into_iter()
+            .partition(|shred| shred.shred_type() == ShredType::Data);
+        // Drop two data and two coding shreds. The rest is more than
+        // DATA_SHREDS_PER_FEC_BLOCK shreds, so the coding shreds are re-encoded
+        // and checked against the received ones.
+        let subset: Vec<Shred> = data_shreds[2..]
+            .iter()
+            .chain(&coding_shreds[2..])
+            .cloned()
+            .collect();
+        let retransmit_sender = new_dummy_retransmit_sender();
+        let thread_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let mut serial =
+            ShredRecoveryContext::new(retransmit_sender.clone(), new_test_bank(0), shred_version);
+        let mut pooled =
+            ShredRecoveryContext::new(retransmit_sender, new_test_bank(0), shred_version)
+                .with_thread_pool(Arc::new(thread_pool));
+        let expected = serial.rebuild_erasure_batch(subset.clone()).unwrap();
+        let actual = pooled.rebuild_erasure_batch(subset).unwrap();
+        assert_eq!(expected.check_fec_set(), Ok(()));
+        assert_eq!(actual.check_fec_set(), expected.check_fec_set());
+        let expected: Vec<_> = expected.into_recovered().collect();
+        assert_eq!(expected.len(), 4);
+        assert_eq!(actual.into_recovered().collect::<Vec<_>>(), expected);
     }
 
     #[test]
